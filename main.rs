@@ -136,8 +136,10 @@ fn main() {
 }
 
 fn server_thread() {
-    let listener = TcpListener::bind("127.0.0.1:7878").expect("Failed to bind to address");
-    eprintln!("Server listening on 127.0.0.1:7878");
+    let port: u16 = 3128;
+    let listener =
+        TcpListener::bind(&format!("127.0.0.1:{}", port)).expect("Failed to bind to address");
+    eprintln!("Server listening on 127.0.0.1:{}", port);
     for stream in listener.incoming() {
         let stream = stream.expect("Connection failed");
         eprintln!("New connection established!");
@@ -157,8 +159,12 @@ pub fn handle_connection(mut stream: TcpStream) {
         }
         let buffer_string = String::from_utf8_lossy(&buffer);
         let lines: Vec<&str> = buffer_string.lines().collect();
-        let first_line: Vec<&str> = lines[0].split(" ").collect();
-        let (host, port) = first_line[1].split_once(":").unwrap();
+        let mut hostport_pair: &str = lines[0].split(" ").collect::<Vec<&str>>()[1];
+        if hostport_pair.starts_with("https://") {
+            hostport_pair = hostport_pair.strip_prefix("https://").unwrap();
+        }
+        let (host, port) = hostport_pair.split_once(":").unwrap();
+        let port: u16 = port.parse().unwrap();
         // let encoded_string: String = general_purpose::STANDARD.encode(&buffer[..size]);
         let value = json!({
             "jsonrpc": "2.0",
