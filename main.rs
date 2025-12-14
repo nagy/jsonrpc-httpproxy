@@ -35,7 +35,7 @@ fn connect_nc_command(stream: TcpStream, args: &[serde_json::Value]) {
     std::mem::forget(stream); // might be needed to not drop the connection.
     let mut cmd = Command::new("nc");
     cmd.arg("-4");
-    for arg in args.into_iter() {
+    for arg in args.iter() {
         match arg {
             serde_json::Value::String(x) => {
                 cmd.arg(x);
@@ -126,7 +126,7 @@ fn main() {
         let response = JsonRPCResponse {
             jsonrpc: "2.0",
             id: request.id,
-            result: result.into(),
+            result,
         };
         println!("{}", serde_json::to_string(&response).unwrap());
         std::io::stdout().flush().unwrap();
@@ -135,7 +135,7 @@ fn main() {
 
 fn server_thread() -> Result<(), Box<dyn std::error::Error>> {
     let port: u16 = 3128;
-    let listener = TcpListener::bind(&format!("127.0.0.1:{}", port))?;
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
     info!("Server listening on 127.0.0.1:{}", port);
     for stream in listener.incoming() {
         let stream = stream.expect("Connection failed");
@@ -143,38 +143,32 @@ fn server_thread() -> Result<(), Box<dyn std::error::Error>> {
             handle_connection(stream);
         });
     }
-    return Err("Should not arrive here.".into());
+    Err("Should not arrive here.".into())
 }
 
 pub fn handle_connection(mut stream: TcpStream) {
     let current_count = GLOBAL_COUNTER.fetch_add(1, Ordering::SeqCst);
     info!("New connection established number: {}", current_count);
     let mut buffer = [0; 1024];
-    while let Ok(size) = stream.read(&mut buffer) {
-        if size == 0 {
-            break;
-        }
-        let mut headers = [httparse::EMPTY_HEADER; 16];
-        let mut req = httparse::Request::new(&mut headers);
-        req.parse(&buffer).unwrap();
-        let mut hostport_pair = req.path.unwrap();
-        if hostport_pair.starts_with("https://") {
-            hostport_pair = hostport_pair.strip_prefix("https://").unwrap();
-        }
-        let (host, port) = hostport_pair.split_once(":").unwrap();
-        let port: u16 = port.parse().unwrap();
-        let value = json!({
-            "jsonrpc": "2.0",
-            "method": "want",
-            "params": [
-                host,
-                port,
-                current_count,
-            ]
-        });
-        println!("{}", serde_json::to_string(&value).unwrap());
-        std::io::stdout().flush().unwrap();
-        GLOBAL_MAP.lock().unwrap().insert(current_count, stream);
-        break;
+    let size = stream.read(&mut buffer).unwrap();
+    if size == 0 {
+        return;
     }
+    let mut headers = [httparse::EMPTY_HEADER; 16];
+    let mut req = httparse::Request::new(&mut headers);
+    req.parse(&buffer).unwrap();
+    let mut hostport_pair = req.path.unwrap();
+    if hostport_pair.starts_with("https://") {
+        hostport_pair = hostport_pair.strip_prefix("https://").unwrap();
+    }
+    let (host, port) = hostport_pair.split_once(":").unwrap();
+    let port: u16 = port.parse().unwrap();
+    let value = json!({
+        "jsonrpc": "2.0",
+        "method": "want",
+        "params": [host, port, current_count]
+    });
+    println!("{}", serde_json::to_string(&value).unwrap());
+    std::io::stdout().flush().unwrap();
+    GLOBAL_MAP.lock().unwrap().insert(current_count, stream);
 }
