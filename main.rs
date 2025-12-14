@@ -111,7 +111,16 @@ fn main() {
                 eprintln!("testing123");
                 connect_nc_command(stream, args);
                 eprintln!("testing126");
-                "ok".into()
+                "accepted".into()
+            }
+            ("deny", [number, _args @ ..]) => {
+                let num = number.as_u64().unwrap() as usize;
+                let mut lock = GLOBAL_MAP.lock().unwrap();
+                let mut stream = lock.remove(&num).unwrap();
+                eprintln!("testing127");
+                stream.write_all(b"HTTP/1.0 403 Denied\r\n\r\n").unwrap();
+                eprintln!("testing128");
+                "denied".into()
             }
             ("concat", words) => {
                 let mut ret = String::new();
@@ -131,7 +140,10 @@ fn main() {
             id: request.id,
             result: result.into(),
         };
-        println!("{}", serde_json::to_string(&response).unwrap());
+        let mut lock = std::io::stdout().lock();
+        writeln!(lock, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+        lock.flush().unwrap();
+        drop(lock);
     }
 }
 
@@ -142,7 +154,6 @@ fn server_thread() {
     eprintln!("Server listening on 127.0.0.1:{}", port);
     for stream in listener.incoming() {
         let stream = stream.expect("Connection failed");
-        eprintln!("New connection established!");
         thread::spawn(move || {
             handle_connection(stream);
         });
@@ -152,6 +163,7 @@ fn server_thread() {
 pub fn handle_connection(mut stream: TcpStream) {
     // use base64::{Engine as _, engine::general_purpose};
     let current_count = GLOBAL_COUNTER.fetch_add(1, Ordering::SeqCst);
+    eprintln!("New connection established!: {}", current_count);
     let mut buffer = [0; 1024];
     while let Ok(size) = stream.read(&mut buffer) {
         if size == 0 {
@@ -176,7 +188,10 @@ pub fn handle_connection(mut stream: TcpStream) {
                 current_count,
             ]
         });
-        println!("{}", serde_json::to_string(&value).unwrap());
+        let mut lock = std::io::stdout().lock();
+        writeln!(lock, "{}", serde_json::to_string(&value).unwrap()).unwrap();
+        lock.flush().unwrap();
+        drop(lock);
         GLOBAL_MAP.lock().unwrap().insert(current_count, stream);
         break;
         // println!("Received: {}", request);
