@@ -1,5 +1,5 @@
 use log::{debug, error, info};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -59,19 +59,13 @@ fn connect_nc_command(stream: TcpStream, args: &[serde_json::Value]) {
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRPCRequest {
+    pub jsonrpc: String,
     pub id: i32,
     pub method: String,
     pub params: Vec<serde_json::Value>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct JsonRPCResponse {
-    pub jsonrpc: &'static str,
-    pub id: i32,
-    pub result: serde_json::Value,
-}
-
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     colog::init();
     std::thread::spawn(|| {
         if let Err(err) = server_thread() {
@@ -79,13 +73,10 @@ fn main() {
             std::process::exit(1);
         }
     });
-    for line in std::io::stdin().lock().lines() {
-        let line = line.expect("Error reading line.");
-        if line.trim().is_empty() {
-            continue;
-        }
+    for line in std::io::stdin().lock().lines().map(Result::unwrap) {
         let request: JsonRPCRequest =
             serde_json::from_str(&line).expect("Failed to parse line as JSON");
+        assert_eq!(request.jsonrpc, "2.0");
         debug!("  -> {:?}", request);
         let result: serde_json::Value = match (request.method.as_str(), request.params.as_slice()) {
             ("add", numbers) => {
@@ -123,52 +114,63 @@ fn main() {
             }
             _ => todo!(),
         };
-        let response = JsonRPCResponse {
-            jsonrpc: "2.0",
-            id: request.id,
-            result,
-        };
-        println!("{}", serde_json::to_string(&response).unwrap());
-        std::io::stdout().flush().unwrap();
+        let response = json! ({
+            "jsonrpc": "2.0",
+            "id": request.id,
+            "result": result,
+        });
+        {
+            let mut lock = std::io::stdout().lock();
+            writeln!(lock, "{}", serde_json::to_string(&response).unwrap())?;
+            lock.flush()?;
+        }
     }
+    Ok(())
 }
 
 fn server_thread() -> Result<(), Box<dyn std::error::Error>> {
-    let port: u16 = 3128;
+    let port: u16 = std::env::var("PORT")
+        .unwrap_or("3128".into())
+        .parse()
+        .unwrap();
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
     info!("Server listening on 127.0.0.1:{}", port);
     for stream in listener.incoming() {
         let stream = stream.expect("Connection failed");
         thread::spawn(move || {
-            handle_connection(stream);
+            handle_connection(stream).unwrap();
         });
     }
     Err("Should not arrive here.".into())
 }
 
-pub fn handle_connection(mut stream: TcpStream) {
+pub fn handle_connection(mut stream: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
     let current_count = GLOBAL_COUNTER.fetch_add(1, Ordering::SeqCst);
     info!("New connection established number: {}", current_count);
     let mut buffer = [0; 1024];
-    let size = stream.read(&mut buffer).unwrap();
+    let size = stream.read(&mut buffer)?;
     if size == 0 {
-        return;
+        return Err("size is now zero.".into());
     }
     let mut headers = [httparse::EMPTY_HEADER; 16];
     let mut req = httparse::Request::new(&mut headers);
-    req.parse(&buffer).unwrap();
+    req.parse(&buffer)?;
     let mut hostport_pair = req.path.unwrap();
     if hostport_pair.starts_with("https://") {
         hostport_pair = hostport_pair.strip_prefix("https://").unwrap();
     }
     let (host, port) = hostport_pair.split_once(":").unwrap();
-    let port: u16 = port.parse().unwrap();
+    let port: u16 = port.parse()?;
     let value = json!({
         "jsonrpc": "2.0",
         "method": "want",
-        "params": [host, port, current_count]
+        "params": [req.method, host, port, current_count]
     });
-    println!("{}", serde_json::to_string(&value).unwrap());
-    std::io::stdout().flush().unwrap();
-    GLOBAL_MAP.lock().unwrap().insert(current_count, stream);
+    {
+        let mut lock = std::io::stdout().lock();
+        writeln!(lock, "{}", serde_json::to_string(&value)?)?;
+        lock.flush()?;
+    }
+    GLOBAL_MAP.lock()?.insert(current_count, stream);
+    Ok(())
 }
