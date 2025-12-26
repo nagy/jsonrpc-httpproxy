@@ -35,13 +35,13 @@ fn connect_nc_command(stream: TcpStream, args: &[serde_json::Value]) {
     std::mem::forget(stream); // might be needed to not drop the connection.
     let mut cmd = Command::new("nc");
     cmd.arg("-4");
-    for arg in args.iter() {
+    for arg in args {
         match arg {
             serde_json::Value::String(x) => {
                 cmd.arg(x);
             }
             serde_json::Value::Number(x) => {
-                cmd.arg(format!("{}", x));
+                cmd.arg(format!("{x}"));
             }
             _ => todo!(),
         }
@@ -69,7 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     colog::init();
     std::thread::spawn(|| {
         if let Err(err) = server_thread() {
-            error!("{:?}", err);
+            error!("{err:?}");
             std::process::exit(1);
         }
     });
@@ -77,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let request: JsonRPCRequest =
             serde_json::from_str(&line).expect("Failed to parse line as JSON");
         assert_eq!(request.jsonrpc, "2.0");
-        debug!("  -> {:?}", request);
+        debug!("  -> {request:?}");
         let result: serde_json::Value = match (request.method.as_str(), request.params.as_slice()) {
             ("add", numbers) => {
                 let mut ret = 0u64;
@@ -133,8 +133,8 @@ fn server_thread() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or("3128".into())
         .parse()
         .unwrap();
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
-    info!("Server listening on 127.0.0.1:{}", port);
+    let listener = TcpListener::bind(format!("127.0.0.1:{port}"))?;
+    info!("Server listening on 127.0.0.1:{port}");
     for stream in listener.incoming() {
         let stream = stream.expect("Connection failed");
         thread::spawn(move || {
@@ -146,7 +146,7 @@ fn server_thread() -> Result<(), Box<dyn std::error::Error>> {
 
 pub fn handle_connection(mut stream: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
     let current_count = GLOBAL_COUNTER.fetch_add(1, Ordering::SeqCst);
-    info!("New connection established number: {}", current_count);
+    info!("New connection established number: {current_count}");
     let mut buffer = [0; 1024];
     let size = stream.read(&mut buffer)?;
     if size == 0 {
@@ -159,7 +159,7 @@ pub fn handle_connection(mut stream: TcpStream) -> Result<(), Box<dyn std::error
     if hostport_pair.starts_with("https://") {
         hostport_pair = hostport_pair.strip_prefix("https://").unwrap();
     }
-    let (host, port) = hostport_pair.split_once(":").unwrap();
+    let (host, port) = hostport_pair.split_once(':').unwrap();
     let port: u16 = port.parse()?;
     let value = json!({
         "jsonrpc": "2.0",
