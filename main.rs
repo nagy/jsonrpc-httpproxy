@@ -1,5 +1,8 @@
+use http::StatusCode;
+use http::Version;
+use http::header::CONTENT_LENGTH;
+use http::header::CONTENT_TYPE;
 use log::{debug, error, info};
-use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -16,6 +19,28 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex};
 use std::thread;
+
+pub fn write_http11<W: std::io::Write, T: Into<Vec<u8>>>(
+    wtr: &mut W,
+    response: http::Response<T>,
+) -> std::io::Result<()> {
+    let (parts, body) = response.into_parts();
+    let reason = parts.status.canonical_reason().unwrap_or("Unknown");
+    writeln!(
+        wtr,
+        "{:?} {} {}\r",
+        parts.version,
+        parts.status.as_u16(),
+        reason
+    )?;
+    for (name, value) in &parts.headers {
+        writeln!(wtr, "{}: {}\r", name, value.to_str().unwrap_or(""))?;
+    }
+    wtr.write_all(b"\r\n")?;
+    wtr.write_all(&body.into())?;
+    wtr.flush()?;
+    Ok(())
+}
 
 static GLOBAL_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -57,10 +82,10 @@ fn connect_nc_command(stream: TcpStream, args: &[serde_json::Value]) {
     });
 }
 
-#[derive(Debug, Deserialize)]
-pub struct JsonRPCRequest {
+#[derive(Debug, serde::Deserialize)]
+struct JsonRPCRequest {
     pub jsonrpc: String,
-    pub id: i32,
+    pub id: u64,
     pub method: String,
     pub params: Vec<serde_json::Value>,
 }
@@ -78,51 +103,91 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             serde_json::from_str(&line).expect("Failed to parse line as JSON");
         assert_eq!(request.jsonrpc, "2.0");
         debug!("  -> {request:?}");
-        let result: serde_json::Value = match (request.method.as_str(), request.params.as_slice()) {
-            ("add", numbers) => {
-                let mut ret = 0u64;
-                for p in numbers {
-                    ret += p.as_u64().unwrap_or(0);
-                }
-                ret.into()
+        let result1 = std::panic::catch_unwind(|| -> Result<(), Box<dyn std::error::Error>> {
+            let result: serde_json::Value =
+                match (request.method.as_str(), request.params.as_slice()) {
+                    ("accept", [number, args @ ..]) => {
+                        let num = number.as_u64().unwrap() as usize;
+                        let mut lock = GLOBAL_MAP.lock().unwrap();
+                        let mut stream = lock.remove(&num).unwrap();
+                        stream.write_all(b"HTTP/1.0 200 OK\r\n\r\n").unwrap();
+                        connect_nc_command(stream, args);
+                        "accepted".into()
+                    }
+                    ("accept-file", [number, file, mimetype]) => {
+                        let num = number.as_u64().unwrap() as usize;
+                        let mut lock = GLOBAL_MAP.lock().unwrap();
+                        let mut stream = lock.remove(&num).unwrap();
+                        if let Ok(filestr) = std::fs::read(file.as_str().unwrap()) {
+                            let res = http::Response::builder()
+                                .version(Version::HTTP_10)
+                                .status(StatusCode::OK)
+                                .header(CONTENT_LENGTH, filestr.len())
+                                .header(CONTENT_TYPE, mimetype.as_str().unwrap())
+                                .body(filestr)
+                                .unwrap();
+                            match write_http11(&mut stream, res) {
+                                Ok(()) => {}
+                                Err(err) => eprintln!("Error: {err:#?}"),
+                            }
+                            "accepted-file".into()
+                        } else {
+                            let reason_text = StatusCode::NOT_FOUND
+                                .canonical_reason()
+                                .unwrap_or("Unknown Reason");
+
+                            let res = http::Response::builder()
+                                .version(Version::HTTP_10)
+                                .status(StatusCode::NOT_FOUND)
+                                .header(CONTENT_LENGTH, reason_text.len())
+                                .header(CONTENT_TYPE, "text/plain")
+                                .body(reason_text)
+                                .unwrap();
+                            match write_http11(&mut stream, res) {
+                                Ok(()) => {}
+                                Err(err) => eprintln!("Error: {err:#?}"),
+                            }
+                            "denied".into()
+                        }
+                    }
+                    ("deny", [number, _args @ ..]) => {
+                        let num = number.as_u64().unwrap() as usize;
+                        let mut lock = GLOBAL_MAP.lock().unwrap();
+                        let mut stream = lock.remove(&num).unwrap();
+
+                        let reason_text = StatusCode::FORBIDDEN
+                            .canonical_reason()
+                            .unwrap_or("Unknown Reason");
+
+                        let res = http::Response::builder()
+                            .version(Version::HTTP_10)
+                            .status(StatusCode::FORBIDDEN)
+                            .header(CONTENT_LENGTH, reason_text.len())
+                            .header(CONTENT_TYPE, "text/plain")
+                            .body(reason_text)
+                            .unwrap();
+                        match write_http11(&mut stream, res) {
+                            Ok(()) => {}
+                            Err(err) => eprintln!("Error: {err:#?}"),
+                        }
+                        "denied".into()
+                    }
+                    _ => todo!(),
+                };
+            let response = json! ({
+                "jsonrpc": "2.0",
+                "id": request.id,
+                "result": result,
+            });
+            {
+                let mut lock = std::io::stdout().lock();
+                writeln!(lock, "{}", serde_json::to_string(&response).unwrap())?;
+                lock.flush()?;
             }
-            ("accept", [number, args @ ..]) => {
-                let num = number.as_u64().unwrap() as usize;
-                let mut lock = GLOBAL_MAP.lock().unwrap();
-                let mut stream = lock.remove(&num).unwrap();
-                stream.write_all(b"HTTP/1.0 200 OK\r\n\r\n").unwrap();
-                connect_nc_command(stream, args);
-                "accepted".into()
-            }
-            ("deny", [number, _args @ ..]) => {
-                let num = number.as_u64().unwrap() as usize;
-                let mut lock = GLOBAL_MAP.lock().unwrap();
-                let mut stream = lock.remove(&num).unwrap();
-                stream.write_all(b"HTTP/1.0 403 Denied\r\n\r\n").unwrap();
-                "denied".into()
-            }
-            ("concat", words) => {
-                let mut ret = String::new();
-                for p in words {
-                    ret += p.as_str().unwrap_or("");
-                }
-                ret.into()
-            }
-            ("duplicate", [s]) => {
-                let s: String = s.as_str().unwrap().to_owned();
-                (s.clone() + &s).into()
-            }
-            _ => todo!(),
-        };
-        let response = json! ({
-            "jsonrpc": "2.0",
-            "id": request.id,
-            "result": result,
+            Ok(())
         });
-        {
-            let mut lock = std::io::stdout().lock();
-            writeln!(lock, "{}", serde_json::to_string(&response).unwrap())?;
-            lock.flush()?;
+        if let Err(err) = result1 {
+            eprintln!("PANIC: {err:#?}");
         }
     }
     Ok(())
@@ -137,14 +202,16 @@ fn server_thread() -> Result<(), Box<dyn std::error::Error>> {
     info!("Server listening on 127.0.0.1:{port}");
     for stream in listener.incoming() {
         let stream = stream.expect("Connection failed");
-        thread::spawn(move || {
-            handle_connection(stream).unwrap();
+        thread::spawn(move || match handle_connection(stream) {
+            Ok(()) => {}
+            Err(err) => eprintln!("Error in thread: {err}"),
         });
     }
-    Err("Should not arrive here.".into())
+    unreachable!();
+    // Err("Should not arrive here.".into())
 }
 
-pub fn handle_connection(mut stream: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_connection(mut stream: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
     let current_count = GLOBAL_COUNTER.fetch_add(1, Ordering::SeqCst);
     info!("New connection established number: {current_count}");
     let mut buffer = [0; 1024];
@@ -154,23 +221,36 @@ pub fn handle_connection(mut stream: TcpStream) -> Result<(), Box<dyn std::error
     }
     let mut headers = [httparse::EMPTY_HEADER; 16];
     let mut req = httparse::Request::new(&mut headers);
-    req.parse(&buffer)?;
-    let mut hostport_pair = req.path.unwrap();
-    if hostport_pair.starts_with("https://") {
-        hostport_pair = hostport_pair.strip_prefix("https://").unwrap();
+    let res = req.parse(&buffer)?;
+    if res.is_partial() {
+        return Err("Partial request".into());
     }
-    let (host, port) = hostport_pair.split_once(':').unwrap();
-    let port: u16 = port.parse()?;
-    let value = json!({
-        "jsonrpc": "2.0",
-        "method": "want",
-        "params": [req.method, host, port, current_count]
-    });
-    {
-        let mut lock = std::io::stdout().lock();
-        writeln!(lock, "{}", serde_json::to_string(&value)?)?;
-        lock.flush()?;
-    }
+    let value = match req.method.unwrap() {
+        "CONNECT" => {
+            let mut hostport_pair = req.path.unwrap();
+            if hostport_pair.starts_with("https://") {
+                hostport_pair = hostport_pair.strip_prefix("https://").unwrap();
+            }
+            let (host, port) = hostport_pair.split_once(':').unwrap();
+            let port: u16 = port.parse()?;
+            json!({
+                "jsonrpc": "2.0",
+                "method": "want",
+                "params": [req.method, host, port, current_count]
+            })
+        }
+        "GET" if req.path.unwrap().starts_with("http://") => {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "gethttp",
+                "params": [req.method, req.path.unwrap(), current_count]
+            })
+        }
+        _ => {
+            return Err(format!("Unknown HTTP Method: {}", req.method.unwrap()).into());
+        }
+    };
+    println!("{value}");
     GLOBAL_MAP.lock()?.insert(current_count, stream);
     Ok(())
 }
