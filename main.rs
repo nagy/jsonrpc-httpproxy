@@ -15,7 +15,7 @@ use std::os::fd::OwnedFd;
 use std::os::fd::RawFd;
 use std::process::Command;
 use std::process::Stdio;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex};
 use std::thread;
@@ -28,10 +28,9 @@ pub fn write_http11<W: std::io::Write, T: Into<Vec<u8>>>(
     let reason = parts.status.canonical_reason().unwrap_or("Unknown");
     writeln!(
         wtr,
-        "{:?} {} {}\r",
+        "{:?} {} {reason}\r",
         parts.version,
         parts.status.as_u16(),
-        reason
     )?;
     for (name, value) in &parts.headers {
         writeln!(wtr, "{}: {}\r", name, value.to_str().unwrap_or(""))?;
@@ -42,9 +41,7 @@ pub fn write_http11<W: std::io::Write, T: Into<Vec<u8>>>(
     Ok(())
 }
 
-static GLOBAL_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-static GLOBAL_MAP: LazyLock<Mutex<HashMap<usize, TcpStream>>> = LazyLock::new(|| {
+static GLOBAL_MAP: LazyLock<Mutex<HashMap<u64, TcpStream>>> = LazyLock::new(|| {
     let map = HashMap::new();
     Mutex::new(map)
 });
@@ -90,7 +87,7 @@ struct JsonRPCRequest {
     pub params: Vec<serde_json::Value>,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     colog::init();
     std::thread::spawn(|| {
         if let Err(err) = server_thread() {
@@ -107,15 +104,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let result: serde_json::Value =
                 match (request.method.as_str(), request.params.as_slice()) {
                     ("accept", [number, args @ ..]) => {
-                        let num = number.as_u64().unwrap() as usize;
+                        let num = number.as_u64().unwrap();
                         let mut lock = GLOBAL_MAP.lock().unwrap();
                         let mut stream = lock.remove(&num).unwrap();
-                        stream.write_all(b"HTTP/1.0 200 OK\r\n\r\n").unwrap();
+                        stream.write_all(b"HTTP/1.0 200 OK\r\n\r\n")?;
+                        stream.flush()?;
                         connect_nc_command(stream, args);
                         "accepted".into()
                     }
                     ("accept-file", [number, file, mimetype]) => {
-                        let num = number.as_u64().unwrap() as usize;
+                        let num = number.as_u64().unwrap();
                         let mut lock = GLOBAL_MAP.lock().unwrap();
                         let mut stream = lock.remove(&num).unwrap();
                         if let Ok(filestr) = std::fs::read(file.as_str().unwrap()) {
@@ -151,7 +149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     ("deny", [number, _args @ ..]) => {
-                        let num = number.as_u64().unwrap() as usize;
+                        let num = number.as_u64().unwrap();
                         let mut lock = GLOBAL_MAP.lock().unwrap();
                         let mut stream = lock.remove(&num).unwrap();
 
@@ -190,7 +188,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("PANIC: {err:#?}");
         }
     }
-    Ok(())
 }
 
 fn server_thread() -> Result<(), Box<dyn std::error::Error>> {
@@ -212,6 +209,7 @@ fn server_thread() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn handle_connection(mut stream: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+    static GLOBAL_COUNTER: AtomicU64 = AtomicU64::new(0);
     let current_count = GLOBAL_COUNTER.fetch_add(1, Ordering::SeqCst);
     info!("New connection established number: {current_count}");
     let mut buffer = [0; 1024];
