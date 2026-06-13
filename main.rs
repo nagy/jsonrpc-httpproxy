@@ -8,13 +8,6 @@ use std::collections::HashMap;
 use std::io::BufRead;
 use std::io::prelude::*;
 use std::net::{TcpListener, TcpStream};
-use std::os::fd::AsRawFd;
-use std::os::fd::BorrowedFd;
-use std::os::fd::FromRawFd;
-use std::os::fd::OwnedFd;
-use std::os::fd::RawFd;
-use std::process::Command;
-use std::process::Stdio;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex};
@@ -41,43 +34,75 @@ pub fn write_http11<W: std::io::Write, T: Into<Vec<u8>>>(
     Ok(())
 }
 
-static GLOBAL_MAP: LazyLock<Mutex<HashMap<u64, TcpStream>>> = LazyLock::new(|| {
+/// Pending connection: the raw TCP stream plus any bytes the client sent
+/// *after* the HTTP CONNECT request line (e.g. the TLS ClientHello) that
+/// httparse didn't consume and must be forwarded to the upstream.
+static GLOBAL_MAP: LazyLock<Mutex<HashMap<u64, (TcpStream, Vec<u8>)>>> = LazyLock::new(|| {
     let map = HashMap::new();
     Mutex::new(map)
 });
 
-fn connect_nc_command(stream: TcpStream, args: &[serde_json::Value]) {
-    fn duplicate_raw_fd(fd: RawFd) -> OwnedFd {
-        let borrowed_fd_reference: BorrowedFd<'_> = unsafe { BorrowedFd::borrow_raw(fd) };
-        borrowed_fd_reference.try_clone_to_owned().unwrap()
+// ── tokio-based CONNECT tunnel (replaces the old `nc` call) ──────────────
+
+/// Bidirectional tunnel between client and upstream, powered by tokio.
+/// Writes `leftover` (bytes already read from the client past the CONNECT
+/// line) to upstream first, then copies both directions concurrently.
+async fn tunnel(
+    client: tokio::net::TcpStream,
+    host: &str,
+    port: u16,
+    leftover: Vec<u8>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let upstream = tokio::net::TcpStream::connect((host, port)).await?;
+    let (mut client_rd, mut client_wr) = client.into_split();
+    let (mut upstream_rd, mut upstream_wr) = upstream.into_split();
+
+    use tokio::io::AsyncWriteExt;
+
+    if !leftover.is_empty() {
+        upstream_wr.write_all(&leftover).await?;
     }
-    let fd = stream.as_raw_fd();
-    let stdio = unsafe { Stdio::from_raw_fd(fd) };
-    let stdio2 = duplicate_raw_fd(fd);
-    std::mem::forget(stream); // might be needed to not drop the connection.
-    let mut cmd = Command::new("nc");
-    cmd.arg("-4");
-    for arg in args {
-        match arg {
-            serde_json::Value::String(x) => {
-                cmd.arg(x);
-            }
-            serde_json::Value::Number(x) => {
-                cmd.arg(format!("{x}"));
-            }
-            _ => todo!(),
+
+    let c2u = tokio::spawn(async move {
+        if let Err(e) = tokio::io::copy(&mut client_rd, &mut upstream_wr).await {
+            error!("client → upstream copy: {e}");
         }
-    }
-    let mut child = cmd
-        .stdin(stdio)
-        .stdout(stdio2)
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        let _ = upstream_wr.shutdown().await;
+    });
+    let u2c = tokio::spawn(async move {
+        if let Err(e) = tokio::io::copy(&mut upstream_rd, &mut client_wr).await {
+            error!("upstream → client copy: {e}");
+        }
+        let _ = client_wr.shutdown().await;
+    });
+
+    c2u.await.unwrap();
+    u2c.await.unwrap();
+    Ok(())
+}
+
+/// Spawn a dedicated OS thread with a single-threaded tokio runtime to run
+/// the tunnel. This keeps `connect_nc_command`'s call-site contract: the
+/// stream is handed off and the caller never sees it again.
+fn spawn_tunnel(stream: TcpStream, host: &str, port: u16, leftover: Vec<u8>) {
+    let host = host.to_owned();
     thread::spawn(move || {
-        std::mem::forget(child.wait());
+        stream.set_nonblocking(true).ok();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        if let Err(e) = rt.block_on(async {
+            let stream = tokio::net::TcpStream::from_std(stream)?;
+            stream.set_nodelay(true)?;
+            tunnel(stream, &host, port, leftover).await
+        }) {
+            error!("tunnel to {host}:{port}: {e}");
+        }
     });
 }
+
+// ── JSON-RPC control loop ────────────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize)]
 struct JsonRPCRequest {
@@ -103,19 +128,25 @@ fn main() {
         let result1 = std::panic::catch_unwind(|| -> Result<(), Box<dyn std::error::Error>> {
             let result: serde_json::Value =
                 match (request.method.as_str(), request.params.as_slice()) {
-                    ("accept", [number, args @ ..]) => {
+                    ("accept", [number, host_val, port_val, rest @ ..]) => {
                         let num = number.as_u64().unwrap();
+                        let port = port_val.as_u64().unwrap() as u16;
                         let mut lock = GLOBAL_MAP.lock().unwrap();
-                        let mut stream = lock.remove(&num).unwrap();
-                        stream.write_all(b"HTTP/1.0 200 OK\r\n\r\n")?;
+                        let (mut stream, leftover) = lock.remove(&num).unwrap();
+                        drop(lock);
+                        stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
                         stream.flush()?;
-                        connect_nc_command(stream, args);
+                        spawn_tunnel(stream, host_val.as_str().unwrap(), port, leftover);
+                        debug!("accepted connection {num} → {host_val}:{port}");
+                        // If the controller passed extra args, ignore them for now;
+                        // they were used by the old `nc` invocation.
+                        let _ = rest;
                         "accepted".into()
                     }
                     ("accept-file", [number, file, mimetype]) => {
                         let num = number.as_u64().unwrap();
                         let mut lock = GLOBAL_MAP.lock().unwrap();
-                        let mut stream = lock.remove(&num).unwrap();
+                        let (mut stream, _leftover) = lock.remove(&num).unwrap();
                         if let Ok(filestr) = std::fs::read(file.as_str().unwrap()) {
                             let res = http::Response::builder()
                                 .version(Version::HTTP_10)
@@ -151,7 +182,7 @@ fn main() {
                     ("deny", [number, _args @ ..]) => {
                         let num = number.as_u64().unwrap();
                         let mut lock = GLOBAL_MAP.lock().unwrap();
-                        let mut stream = lock.remove(&num).unwrap();
+                        let (mut stream, _leftover) = lock.remove(&num).unwrap();
 
                         let reason_text = StatusCode::FORBIDDEN
                             .canonical_reason()
@@ -205,7 +236,6 @@ fn server_thread() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     unreachable!();
-    // Err("Should not arrive here.".into())
 }
 
 fn handle_connection(mut stream: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
@@ -219,10 +249,12 @@ fn handle_connection(mut stream: TcpStream) -> Result<(), Box<dyn std::error::Er
     }
     let mut headers = [httparse::EMPTY_HEADER; 16];
     let mut req = httparse::Request::new(&mut headers);
-    let res = req.parse(&buffer)?;
+    let res = req.parse(&buffer[..size])?;
     if res.is_partial() {
         return Err("Partial request".into());
     }
+    let consumed = res.unwrap();
+    let leftover = buffer[consumed..size].to_vec();
     let value = match req.method.unwrap() {
         "CONNECT" => {
             let mut hostport_pair = req.path.unwrap();
@@ -249,6 +281,6 @@ fn handle_connection(mut stream: TcpStream) -> Result<(), Box<dyn std::error::Er
         }
     };
     println!("{value}");
-    GLOBAL_MAP.lock()?.insert(current_count, stream);
+    GLOBAL_MAP.lock()?.insert(current_count, (stream, leftover));
     Ok(())
 }

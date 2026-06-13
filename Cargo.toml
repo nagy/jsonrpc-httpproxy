@@ -10,6 +10,7 @@ httparse = "1.10.1"
 log = "0.4.29"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.145", features = ["preserve_order"] }
+tokio = { version = "1", features = ["net", "rt", "io-util"] }
 
 [[bin]]
 name = "jsonrpc_httpproxy"
