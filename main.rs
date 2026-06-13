@@ -39,7 +39,7 @@ pub fn write_http11<W: std::io::Write, T: Into<Vec<u8>>>(
 // ── connection state ─────────────────────────────────────────────────────
 
 /// A tiny channel handle is parked in the global map instead of the full
-/// TcpStream.  The connection thread keeps the stream and blocks on the
+/// `TcpStream`.  The connection thread keeps the stream and blocks on the
 /// receiver until the controller sends a decision.
 #[derive(Debug)]
 enum Decision {
@@ -64,11 +64,11 @@ async fn tunnel(
     port: u16,
     leftover: Vec<u8>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::AsyncWriteExt;
+
     let upstream = tokio::net::TcpStream::connect((host, port)).await?;
     let (mut client_rd, mut client_wr) = client.into_split();
     let (mut upstream_rd, mut upstream_wr) = upstream.into_split();
-
-    use tokio::io::AsyncWriteExt;
 
     if !leftover.is_empty() {
         upstream_wr.write_all(&leftover).await?;
@@ -184,7 +184,7 @@ fn require_u64(val: &serde_json::Value, pos: usize) -> Result<u64, JsonRpcError>
     })
 }
 
-fn require_str<'a>(val: &'a serde_json::Value, pos: usize) -> Result<&'a str, JsonRpcError> {
+fn require_str(val: &serde_json::Value, pos: usize) -> Result<&str, JsonRpcError> {
     val.as_str().ok_or_else(|| {
         JsonRpcError::invalid_params(format!(
             "param {pos}: expected string, got {val}"
@@ -273,7 +273,9 @@ fn main() {
             match (request.method.as_str(), request.params.as_slice()) {
                 ("accept", [number, host_val, port_val, rest @ ..]) => {
                     let num = require_u64(number, 1)?;
-                    let port = require_u64(port_val, 2)? as u16;
+                    let port = u16::try_from(require_u64(port_val, 2)?).map_err(|_| {
+                        JsonRpcError::invalid_params("param 2: port out of range (0-65535)")
+                    })?;
                     let host = require_str(host_val, 1)?;
                     let mut lock = GLOBAL_MAP.lock().unwrap();
                     match lock.remove(&num) {
@@ -403,12 +405,9 @@ fn handle_connection(mut stream: TcpStream) {
     let consumed = res.unwrap();
     let leftover = buffer[consumed..size].to_vec();
 
-    let method = match req.method {
-        Some(m) => m,
-        None => {
-            error!("connection {current_count}: missing method");
-            return;
-        }
+    let Some(method) = req.method else {
+        error!("connection {current_count}: missing method");
+        return;
     };
     let value = match method {
         "CONNECT" => {
@@ -464,7 +463,7 @@ fn handle_connection(mut stream: TcpStream) {
         Ok(Decision::Deny) => {
             deny_connection(&mut stream);
         }
-        Ok(Decision::Shutdown) => {
+        Ok(Decision::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
             send_502(&mut stream);
         }
         Err(RecvTimeoutError::Timeout) => {
@@ -478,9 +477,6 @@ fn handle_connection(mut stream: TcpStream) {
                 .unwrap();
             write_http11(&mut stream, res).ok();
             error!("connection {current_count}: controller decision timed out");
-        }
-        Err(RecvTimeoutError::Disconnected) => {
-            send_502(&mut stream);
         }
     }
 }
