@@ -102,6 +102,32 @@ fn spawn_tunnel(stream: TcpStream, host: &str, port: u16, leftover: Vec<u8>) {
     });
 }
 
+// ── graceful shutdown ───────────────────────────────────────────────────
+
+/// Send HTTP 502 Bad Gateway to every pending connection and remove them
+/// from the global map.
+fn drain_connections() {
+    let mut lock = GLOBAL_MAP.lock().unwrap();
+    if lock.is_empty() {
+        return;
+    }
+    let body = "proxy shutting down";
+    let count = lock.len();
+    for (_id, (mut stream, _leftover)) in lock.drain() {
+        let res = http::Response::builder()
+            .version(Version::HTTP_11)
+            .status(StatusCode::BAD_GATEWAY)
+            .header(CONTENT_LENGTH, body.len())
+            .header(CONTENT_TYPE, "text/plain")
+            .body(body)
+            .unwrap();
+        if let Err(e) = write_http11(&mut stream, res) {
+            error!("drain: failed to send 502: {e}");
+        }
+    }
+    info!("drained {count} pending connections");
+}
+
 // ── JSON-RPC control loop ────────────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize)]
@@ -120,11 +146,35 @@ fn main() {
             std::process::exit(1);
         }
     });
+    ctrlc::set_handler(|| {
+        info!("received SIGINT, draining connections and shutting down");
+        drain_connections();
+        std::process::exit(0);
+    })
+    .expect("failed to set SIGINT handler");
+
     for line in std::io::stdin().lock().lines().map(Result::unwrap) {
         let request: JsonRPCRequest =
             serde_json::from_str(&line).expect("Failed to parse line as JSON");
         assert_eq!(request.jsonrpc, "2.0");
         debug!("  -> {request:?}");
+
+        if request.method == "shutdown" {
+            let response = json!({
+                "jsonrpc": "2.0",
+                "id": request.id,
+                "result": "shutting down",
+            });
+            {
+                let mut lock = std::io::stdout().lock();
+                writeln!(lock, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+                lock.flush().unwrap();
+            }
+            info!("shutdown via JSON-RPC, draining connections");
+            drain_connections();
+            std::process::exit(0);
+        }
+
         let result1 = std::panic::catch_unwind(|| -> Result<(), Box<dyn std::error::Error>> {
             let result: serde_json::Value =
                 match (request.method.as_str(), request.params.as_slice()) {
