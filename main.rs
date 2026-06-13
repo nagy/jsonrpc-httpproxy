@@ -144,6 +144,53 @@ fn serve_file(stream: &mut TcpStream, path: &str, mimetype: &str) {
     }
 }
 
+// ── JSON-RPC error handling ──────────────────────────────────────────────
+
+#[derive(Debug, serde::Serialize)]
+struct JsonRpcError {
+    code: i64,
+    message: String,
+}
+
+#[allow(dead_code)]
+impl JsonRpcError {
+    const PARSE_ERROR: i64 = -32700;
+    const INVALID_REQUEST: i64 = -32600;
+    const METHOD_NOT_FOUND: i64 = -32601;
+    const INVALID_PARAMS: i64 = -32602;
+    const INTERNAL_ERROR: i64 = -32603;
+
+    fn method_not_found(method: &str) -> Self {
+        JsonRpcError {
+            code: Self::METHOD_NOT_FOUND,
+            message: format!("unknown method: {method}"),
+        }
+    }
+
+    fn invalid_params(msg: impl Into<String>) -> Self {
+        JsonRpcError {
+            code: Self::INVALID_PARAMS,
+            message: msg.into(),
+        }
+    }
+}
+
+fn require_u64(val: &serde_json::Value, pos: usize) -> Result<u64, JsonRpcError> {
+    val.as_u64().ok_or_else(|| {
+        JsonRpcError::invalid_params(format!(
+            "param {pos}: expected number, got {val}"
+        ))
+    })
+}
+
+fn require_str<'a>(val: &'a serde_json::Value, pos: usize) -> Result<&'a str, JsonRpcError> {
+    val.as_str().ok_or_else(|| {
+        JsonRpcError::invalid_params(format!(
+            "param {pos}: expected string, got {val}"
+        ))
+    })
+}
+
 // ── JSON-RPC control loop ────────────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize)]
@@ -152,6 +199,12 @@ struct JsonRPCRequest {
     pub id: u64,
     pub method: String,
     pub params: Vec<serde_json::Value>,
+}
+
+fn send_response(response: &serde_json::Value) {
+    let mut lock = std::io::stdout().lock();
+    let _ = writeln!(lock, "{}", serde_json::to_string(response).unwrap());
+    let _ = lock.flush();
 }
 
 fn main() {
@@ -171,9 +224,30 @@ fn main() {
     });
 
     for line in std::io::stdin().lock().lines().map(Result::unwrap) {
-        let request: JsonRPCRequest =
-            serde_json::from_str(&line).expect("Failed to parse line as JSON");
-        assert_eq!(request.jsonrpc, "2.0");
+        let request: JsonRPCRequest = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("parse error: {e}");
+                let err = json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": { "code": JsonRpcError::PARSE_ERROR, "message": format!("Parse error: {e}") },
+                });
+                send_response(&err);
+                continue;
+            }
+        };
+
+        if request.jsonrpc != "2.0" {
+            let err = json!({
+                "jsonrpc": "2.0",
+                "id": request.id,
+                "error": { "code": JsonRpcError::INVALID_REQUEST, "message": "jsonrpc must be '2.0'" },
+            });
+            send_response(&err);
+            continue;
+        }
+
         debug!("  -> {request:?}");
 
         if request.method == "shutdown" {
@@ -182,11 +256,7 @@ fn main() {
                 "id": request.id,
                 "result": "shutting down",
             });
-            {
-                let mut lock = std::io::stdout().lock();
-                writeln!(lock, "{}", serde_json::to_string(&response).unwrap()).unwrap();
-                lock.flush().unwrap();
-            }
+            send_response(&response);
             info!("shutdown via JSON-RPC, notifying pending connections");
             let mut lock = GLOBAL_MAP.lock().unwrap();
             for (_, tx) in lock.drain() {
@@ -196,63 +266,81 @@ fn main() {
             std::process::exit(0);
         }
 
-        let result1 = std::panic::catch_unwind(|| -> Result<(), Box<dyn std::error::Error>> {
-            let result: serde_json::Value =
-                match (request.method.as_str(), request.params.as_slice()) {
-                    ("accept", [number, host_val, port_val, rest @ ..]) => {
-                        let num = number.as_u64().unwrap();
-                        let port = port_val.as_u64().unwrap() as u16;
-                        let host = host_val.as_str().unwrap();
-                        let mut lock = GLOBAL_MAP.lock().unwrap();
-                        if let Some(tx) = lock.remove(&num) {
+        // ── dispatch ──────────────────────────────────────────────────
+
+        let result: Result<serde_json::Value, JsonRpcError> = (|| -> Result<_, JsonRpcError> {
+            match (request.method.as_str(), request.params.as_slice()) {
+                ("accept", [number, host_val, port_val, rest @ ..]) => {
+                    let num = require_u64(number, 1)?;
+                    let port = require_u64(port_val, 2)? as u16;
+                    let host = require_str(host_val, 1)?;
+                    let mut lock = GLOBAL_MAP.lock().unwrap();
+                    match lock.remove(&num) {
+                        Some(tx) => {
                             tx.send(Decision::Accept {
                                 host: host.to_owned(),
                                 port,
                             })
                             .ok();
+                            drop(lock);
+                            debug!("accepted connection {num} → {host}:{port}");
+                            let _ = rest;
+                            Ok("accepted".into())
                         }
-                        drop(lock);
-                        debug!("accepted connection {num} → {host}:{port}");
-                        let _ = rest;
-                        "accepted".into()
+                        None => Err(JsonRpcError::invalid_params(format!(
+                            "unknown connection id: {num}"
+                        ))),
                     }
-                    ("accept-file", [number, file, mimetype]) => {
-                        let num = number.as_u64().unwrap();
-                        let mut lock = GLOBAL_MAP.lock().unwrap();
-                        if let Some(tx) = lock.remove(&num) {
+                }
+                ("accept-file", [number, file, mimetype]) => {
+                    let num = require_u64(number, 1)?;
+                    let file = require_str(file, 2)?;
+                    let mimetype = require_str(mimetype, 3)?;
+                    let mut lock = GLOBAL_MAP.lock().unwrap();
+                    match lock.remove(&num) {
+                        Some(tx) => {
                             tx.send(Decision::AcceptFile {
-                                path: file.as_str().unwrap().to_owned(),
-                                mimetype: mimetype.as_str().unwrap().to_owned(),
+                                path: file.to_owned(),
+                                mimetype: mimetype.to_owned(),
                             })
                             .ok();
+                            Ok("accepted-file".into())
                         }
-                        "accepted-file".into()
+                        None => Err(JsonRpcError::invalid_params(format!(
+                            "unknown connection id: {num}"
+                        ))),
                     }
-                    ("deny", [number, _args @ ..]) => {
-                        let num = number.as_u64().unwrap();
-                        let mut lock = GLOBAL_MAP.lock().unwrap();
-                        if let Some(tx) = lock.remove(&num) {
+                }
+                ("deny", [number, ..]) => {
+                    let num = require_u64(number, 1)?;
+                    let mut lock = GLOBAL_MAP.lock().unwrap();
+                    match lock.remove(&num) {
+                        Some(tx) => {
                             tx.send(Decision::Deny).ok();
+                            Ok("denied".into())
                         }
-                        "denied".into()
+                        None => Err(JsonRpcError::invalid_params(format!(
+                            "unknown connection id: {num}"
+                        ))),
                     }
-                    _ => todo!(),
-                };
-            let response = json!({
+                }
+                _ => Err(JsonRpcError::method_not_found(&request.method)),
+            }
+        })();
+
+        let response = match result {
+            Ok(value) => json!({
                 "jsonrpc": "2.0",
                 "id": request.id,
-                "result": result,
-            });
-            {
-                let mut lock = std::io::stdout().lock();
-                writeln!(lock, "{}", serde_json::to_string(&response).unwrap())?;
-                lock.flush()?;
-            }
-            Ok(())
-        });
-        if let Err(err) = result1 {
-            eprintln!("PANIC: {err:#?}");
-        }
+                "result": value,
+            }),
+            Err(e) => json!({
+                "jsonrpc": "2.0",
+                "id": request.id,
+                "error": { "code": e.code, "message": e.message },
+            }),
+        };
+        send_response(&response);
     }
 }
 
