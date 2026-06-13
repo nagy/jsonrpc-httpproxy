@@ -10,9 +10,10 @@ use std::io::prelude::*;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender};
 use std::sync::{LazyLock, Mutex};
 use std::thread;
+use std::time::Duration;
 
 pub fn write_http11<W: std::io::Write, T: Into<Vec<u8>>>(
     wtr: &mut W,
@@ -365,12 +366,23 @@ fn handle_connection(mut stream: TcpStream) {
     let current_count = GLOBAL_COUNTER.fetch_add(1, Ordering::SeqCst);
     info!("New connection established number: {current_count}");
 
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+
     let mut buffer = [0; 1024];
     let size = match stream.read(&mut buffer) {
         Ok(0) => return,
         Ok(n) => n,
         Err(e) => {
-            error!("connection {current_count}: read error: {e}");
+            let body = "408 Request Timeout";
+            let res = http::Response::builder()
+                .version(Version::HTTP_11)
+                .status(StatusCode::REQUEST_TIMEOUT)
+                .header(CONTENT_LENGTH, body.len())
+                .header(CONTENT_TYPE, "text/plain")
+                .body(body)
+                .unwrap();
+            write_http11(&mut stream, res).ok();
+            error!("connection {current_count}: read timeout/error: {e}");
             return;
         }
     };
@@ -429,7 +441,7 @@ fn handle_connection(mut stream: TcpStream) {
     GLOBAL_MAP.lock().unwrap().insert(current_count, tx);
     println!("{value}"); // notify controller *after* inserting into map
 
-    match rx.recv() {
+    match rx.recv_timeout(Duration::from_secs(30)) {
         Ok(Decision::Accept { host, port }) => {
             let _ = stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n");
             let _ = stream.flush();
@@ -452,7 +464,22 @@ fn handle_connection(mut stream: TcpStream) {
         Ok(Decision::Deny) => {
             deny_connection(&mut stream);
         }
-        Ok(Decision::Shutdown) | Err(_) => {
+        Ok(Decision::Shutdown) => {
+            send_502(&mut stream);
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            let body = "504 Gateway Timeout";
+            let res = http::Response::builder()
+                .version(Version::HTTP_11)
+                .status(StatusCode::GATEWAY_TIMEOUT)
+                .header(CONTENT_LENGTH, body.len())
+                .header(CONTENT_TYPE, "text/plain")
+                .body(body)
+                .unwrap();
+            write_http11(&mut stream, res).ok();
+            error!("connection {current_count}: controller decision timed out");
+        }
+        Err(RecvTimeoutError::Disconnected) => {
             send_502(&mut stream);
         }
     }

@@ -194,8 +194,8 @@ nix-build default.nix   # or: nix build
 
 ## Known limitations / future work
 
-1. **No timeout on pending connections** — if the controller never sends
-   `accept`/`deny`, the connection thread blocks forever on `rx.recv()`.
+1. ~~**No timeout on pending connections**~~ — resolved: client read has 5 s
+   timeout (→ 408), controller decision has 30 s timeout (→ 504).
 2. **Two threads write to stdout** (connection threads for notifications,
    main thread for responses). Line-delimited JSON usually survives
    interleaving, but a single-writer mpsc channel would be safer.
