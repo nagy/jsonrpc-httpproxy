@@ -61,11 +61,20 @@ All messages are single-line JSON. The server talks JSON-RPC 2.0.
 
 ### Server → controller (stdout, responses — echo `id`)
 
+Success:
 ```json
 {"jsonrpc":"2.0","id":<n>,"result":"accepted"}
 {"jsonrpc":"2.0","id":<n>,"result":"accepted-file"}
 {"jsonrpc":"2.0","id":<n>,"result":"denied"}
 {"jsonrpc":"2.0","id":<n>,"result":"shutting down"}
+```
+
+Error (standard JSON-RPC 2.0 error object):
+```json
+{"jsonrpc":"2.0","id":<n>,"error":{"code":-32602,"message":"unknown connection id: 5"}}
+{"jsonrpc":"2.0","id":<n>,"error":{"code":-32601,"message":"unknown method: bogus"}}
+{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error: ..."}}
+{"jsonrpc":"2.0","id":<n>,"error":{"code":-32600,"message":"jsonrpc must be '2.0'"}}
 ```
 
 ## Key implementation details
@@ -120,11 +129,46 @@ enum Decision {
 - **Leftover bytes** (e.g. the TLS ClientHello) are forwarded to upstream
   before the copy loop starts.
 
+### Error handling
+
+All JSON-RPC-level errors are reported to the controller rather than
+crashing the proxy.  A lightweight `JsonRpcError` struct carries standard
+JSON-RPC 2.0 error codes:
+
+| code     | constant          | returned when                                |
+|----------|-------------------|----------------------------------------------|
+| `-32700` | `PARSE_ERROR`     | stdin line is not valid JSON                  |
+| `-32600` | `INVALID_REQUEST` | `jsonrpc` field is not `"2.0"`                |
+| `-32601` | `METHOD_NOT_FOUND`| unknown method name                          |
+| `-32602` | `INVALID_PARAMS`  | wrong param type, unknown connection id      |
+
+Two tiny helpers validate parameters:
+
+```rust
+fn require_u64(val: &Value, pos: usize) -> Result<u64, JsonRpcError>;
+fn require_str(val: &Value, pos: usize) -> Result<&str, JsonRpcError>;
+```
+
+The dispatch closure returns `Result<serde_json::Value, JsonRpcError>`.  At
+the boundary this is mapped to either `{"result": …}` or `{"error": …}` and
+written to stdout via `send_response()`.  There is no `catch_unwind` — errors
+are first-class return values.
+
+### Response helpers
+
+`send_502()`, `deny_connection()`, and `serve_file()` are called from the
+connection thread to write HTTP responses directly to the client socket.
+They use `write_http11` internally and silently ignore I/O errors (the
+client may have disconnected).
+
+`send_response()` writes a JSON-RPC response/error to stdout from the main
+thread.  It also ignores I/O errors — if stdout is broken the proxy is
+unusable anyway.
+
 ### HTTP response writer (`write_http11`)
 
-Generic over `W: Write`. Used by `accept-file` and `deny` to send proper HTTP
-responses with status line, headers, and body. Handles both HTTP/1.0 and
-HTTP/1.1.
+Generic over `W: Write`. Handles both HTTP/1.0 and HTTP/1.1 with status
+line, headers, and body.
 
 ## Configuration
 
@@ -152,20 +196,17 @@ nix-build default.nix   # or: nix build
 
 1. **No timeout on pending connections** — if the controller never sends
    `accept`/`deny`, the connection thread blocks forever on `rx.recv()`.
-2. **`unwrap()` / `expect()` scattered throughout** — malformed JSON, missing
-   map entries, or unexpected parameter types will panic the control thread
-   (and drop all in-flight connections).
-3. **Two threads write to stdout** (connection threads for notifications,
+2. **Two threads write to stdout** (connection threads for notifications,
    main thread for responses). Line-delimited JSON usually survives
    interleaving, but a single-writer mpsc channel would be safer.
-4. **SIGINT handler doesn't drain** — it calls `process::exit(0)` to avoid
+3. **SIGINT handler doesn't drain** — it calls `process::exit(0)` to avoid
    potential deadlock on the `GLOBAL_MAP` mutex.  Clients get TCP RST instead
    of a graceful 502.  The JSON-RPC `shutdown` method *does* drain gracefully.
-5. **`accept-file` and `deny` throw away leftover bytes** — if the client sent
+4. **`accept-file` and `deny` throw away leftover bytes** — if the client sent
    data after its request line on a GET or a denied CONNECT, those bytes are
    silently dropped.
-6. **One OS thread per connection + one tokio runtime per tunnel** — fine for
+5. **One OS thread per connection + one tokio runtime per tunnel** — fine for
    low-volume use; a full async rewrite with a shared tokio runtime would be
    needed for hundreds of concurrent connections.
-7. **Blocking `std::fs::read` in `accept-file`** — blocks the connection
+6. **Blocking `std::fs::read` in `accept-file`** — blocks the connection
    thread while reading the file.
