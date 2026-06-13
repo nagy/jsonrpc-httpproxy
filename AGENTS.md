@@ -6,24 +6,32 @@ process via line-delimited JSON-RPC over stdin/stdout.
 
 ## Architecture
 
-Two concurrent components run inside a single binary:
+Two concurrent components run inside a single binary.
+The `TcpStream` never crosses thread boundaries — the connection thread
+keeps ownership of the socket for its entire lifetime.
 
 ```
-┌─────────────── client connections ───────────────┐
-│                                                   │
-│  server_thread (TcpListener :3128)                │
-│    │  per-connection: handle_connection()         │
-│    │    → parses CONNECT / GET                    │
-│    │    → prints "want" / "gethttp" notification  │
-│    │    → parks (TcpStream, leftover) in GLOBAL_MAP │
-│    │                                              │
-│  ┌─ GLOBAL_MAP: HashMap<u64, (TcpStream, Vec<u8>)> │
-│  │                                              │
-│  main thread (stdin JSON-RPC loop)               │
-│    ← controller sends accept / accept-file / deny │
-│    → responds on stdout with JSON-RPC result      │
-│                                                   │
-└───────────────────────────────────────────────────┘
+┌─────────────── client connections ─────────────────────────────┐
+│                                                                 │
+│  server_thread (TcpListener :3128)                              │
+│    │  per-connection: handle_connection()  ← long-lived thread  │
+│    │    → parses CONNECT / GET                                  │
+│    │    → prints "want" / "gethttp" notification                │
+│    │    → parks SyncSender<Decision> in GLOBAL_MAP              │
+│    │    → blocks on rx.recv()                                   │
+│    │    → on Decision::Accept: tunnels via tokio inline         │
+│    │    → on Decision::AcceptFile: serve_file()                 │
+│    │    → on Decision::Deny: deny_connection()                  │
+│    │    → on Decision::Shutdown / channel close: send_502()     │
+│    │                                                            │
+│  ┌─ GLOBAL_MAP: HashMap<u64, SyncSender<Decision>>   (tiny!)    │
+│  │                                                            │
+│  main thread (stdin JSON-RPC loop)                             │
+│    ← controller sends accept / accept-file / deny / shutdown   │
+│    → sends Decision through channel (no I/O on stream)         │
+│    → responds on stdout with JSON-RPC result                   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
         ↑ stdout (notifications + responses)
         ↓ stdin  (commands)
    ┌──────────────┐
@@ -49,6 +57,7 @@ All messages are single-line JSON. The server talks JSON-RPC 2.0.
 | `accept`     | `[connection_id, host, port]`          | tunnel to upstream via tokio                              |
 | `accept-file`| `[connection_id, filepath, mimetype]`  | serve a local file as HTTP response                       |
 | `deny`       | `[connection_id]`                      | respond HTTP 403 Forbidden                                |
+| `shutdown`   | (none)                                  | send Shutdown to all pending channels, then exit          |
 
 ### Server → controller (stdout, responses — echo `id`)
 
@@ -56,37 +65,60 @@ All messages are single-line JSON. The server talks JSON-RPC 2.0.
 {"jsonrpc":"2.0","id":<n>,"result":"accepted"}
 {"jsonrpc":"2.0","id":<n>,"result":"accepted-file"}
 {"jsonrpc":"2.0","id":<n>,"result":"denied"}
+{"jsonrpc":"2.0","id":<n>,"result":"shutting down"}
 ```
 
 ## Key implementation details
 
-### CONNECT tunnel (`tunnel` + `spawn_tunnel`)
+### Channel-per-connection architecture
 
-- Pure Rust — no external `nc` dependency.
-- Uses tokio with a **single-threaded `current_thread` runtime per tunnel**,
-  spawned on its own OS thread. This keeps the rest of the code synchronous
-  while avoiding a global async rewrite.
-- `TcpStream::into_split()` splits client and upstream each into read/write
-  halves. Two `tokio::spawn` tasks copy concurrently. When one read-half hits
-  EOF the corresponding write-half is shut down (proper TCP half-close).
-- **`Nagle` is disabled** (`set_nodelay(true)`) on the tokio stream for
-  low-latency forwarding.
-- **Leftover bytes**: after `httparse` parses the CONNECT line, any remaining
-  bytes in the 1024-byte read buffer (e.g. the TLS ClientHello) are stored as
-  `Vec<u8>` in `GLOBAL_MAP` and forwarded to upstream before the copy loop
-  starts.
-
-### GLOBAL_MAP
+Instead of parking the raw `TcpStream` in a global map and transferring it
+across threads, the connection thread **keeps ownership** of the socket for
+its entire lifetime.  Only a tiny `SyncSender<Decision>` is stored in
+`GLOBAL_MAP`:
 
 ```rust
-LazyLock<Mutex<HashMap<u64, (TcpStream, Vec<u8>)>>>
+LazyLock<Mutex<HashMap<u64, SyncSender<Decision>>>>
 ```
 
-Key: monotonically incrementing `AtomicU64` counter.
-Value: the raw blocking `std::net::TcpStream` + leftover bytes.
+The connection thread blocks on `rx.recv()` until the controller (via the
+main thread) pushes a `Decision` through the channel.  The stream never
+leaves its thread — no `set_nonblocking` + `from_std` dance at decision time.
 
-The stream sits idle (blocking, not read) while waiting for the controller's
-decision.
+#### Decision enum
+
+```rust
+enum Decision {
+    Accept { host: String, port: u16 },
+    AcceptFile { path: String, mimetype: String },
+    Deny,
+    Shutdown,
+}
+```
+
+#### Benefits over the old cross-thread-stream approach
+
+- **Stream ownership is clean**: one thread per connection from accept to
+  close, no cross-thread fd juggling.
+- **Main thread does no I/O on client sockets**: it only sends decisions
+  through channels — fast, non-blocking, can't panic on a dead socket.
+- **Shutdown is free**: when the process drops all `SyncSender`s (or sends
+  `Decision::Shutdown`), every blocked `recv()` unblocks.  Each connection
+  thread sends its own 502 and exits.  No central `drain_connections()`.
+- **Leftover bytes stay local**: `handle_connection` captures them after
+  `httparse` and holds them in a stack variable until the tunnel starts.
+
+### CONNECT tunnel (`tunnel`)
+
+- Pure Rust — no external `nc` dependency.
+- The `handle_connection` thread builds a single-threaded tokio runtime
+  inline and calls `block_on(tunnel(...))`.  One OS thread per active tunnel.
+- `TcpStream::into_split()` splits client and upstream each into read/write
+  halves.  Two `tokio::spawn` tasks copy concurrently with proper TCP
+  half-close via `shutdown()`.
+- **`Nagle` is disabled** (`set_nodelay(true)`) for low-latency forwarding.
+- **Leftover bytes** (e.g. the TLS ClientHello) are forwarded to upstream
+  before the copy loop starts.
 
 ### HTTP response writer (`write_http11`)
 
@@ -119,20 +151,21 @@ nix-build default.nix   # or: nix build
 ## Known limitations / future work
 
 1. **No timeout on pending connections** — if the controller never sends
-   `accept`/`deny`, the stream stays in `GLOBAL_MAP` forever and the client
-   hangs indefinitely.
+   `accept`/`deny`, the connection thread blocks forever on `rx.recv()`.
 2. **`unwrap()` / `expect()` scattered throughout** — malformed JSON, missing
    map entries, or unexpected parameter types will panic the control thread
    (and drop all in-flight connections).
-3. **Two threads write to stdout** (server thread for notifications, main
-   thread for responses). Line-delimited JSON usually survives interleaving,
-   but a single-writer mpsc channel would be safer.
-4. **No graceful shutdown** — no signal handler, no `shutdown` JSON-RPC method.
+3. **Two threads write to stdout** (connection threads for notifications,
+   main thread for responses). Line-delimited JSON usually survives
+   interleaving, but a single-writer mpsc channel would be safer.
+4. **SIGINT handler doesn't drain** — it calls `process::exit(0)` to avoid
+   potential deadlock on the `GLOBAL_MAP` mutex.  Clients get TCP RST instead
+   of a graceful 502.  The JSON-RPC `shutdown` method *does* drain gracefully.
 5. **`accept-file` and `deny` throw away leftover bytes** — if the client sent
    data after its request line on a GET or a denied CONNECT, those bytes are
    silently dropped.
 6. **One OS thread per connection + one tokio runtime per tunnel** — fine for
    low-volume use; a full async rewrite with a shared tokio runtime would be
    needed for hundreds of concurrent connections.
-7. **Blocking `std::fs::read` in `accept-file`** — blocks the main JSON-RPC
-   loop while reading the file.
+7. **Blocking `std::fs::read` in `accept-file`** — blocks the connection
+   thread while reading the file.
