@@ -241,7 +241,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "jsonrpc_httpproxy"
+name = "jsonrpc-httpproxy"
 version = "0.1.0"
 dependencies = [
  "colog",

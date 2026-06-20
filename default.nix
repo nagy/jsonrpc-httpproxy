@@ -5,7 +5,7 @@
 }:
 
 rustPlatform.buildRustPackage (finalAttrs: {
-  pname = "jsonrpc_httpproxy";
+  pname = "jsonrpc-httpproxy";
   version = "0.0.1";
   src = lib.cleanSource ./.;
   cargoLock = {

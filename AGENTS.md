@@ -1,4 +1,4 @@
-# AGENTS.md — jsonrpc_httpproxy
+# AGENTS.md — jsonrpc-httpproxy
 
 A JSON-RPC-controlled HTTP/HTTPS intercepting proxy. It accepts client
 connections but **defers all routing decisions** to an external "controller"
@@ -185,7 +185,7 @@ Log level via `RUST_LOG` (uses `colog` → `env_logger`).
 ```bash
 cargo build
 echo '{"jsonrpc":"2.0","id":1,"method":"accept","params":[0,"example.com",443]}' \
-  | ./target/debug/jsonrpc_httpproxy
+  | ./target/debug/jsonrpc-httpproxy
 ```
 
 ```bash

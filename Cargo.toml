@@ -1,5 +1,5 @@
 [package]
-name = "jsonrpc_httpproxy"
+name = "jsonrpc-httpproxy"
 version = "0.1.0"
 edition = "2024"
 
@@ -14,5 +14,5 @@ serde_json = { version = "1.0.145", features = ["preserve_order"] }
 tokio = { version = "1", features = ["net", "rt", "io-util"] }
 
 [[bin]]
-name = "jsonrpc_httpproxy"
+name = "jsonrpc-httpproxy"
 path = "main.rs"
