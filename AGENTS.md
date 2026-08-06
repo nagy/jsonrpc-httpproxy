@@ -92,7 +92,7 @@ LazyLock<Mutex<HashMap<u64, SyncSender<Decision>>>>
 
 The connection thread blocks on `rx.recv()` until the controller (via the
 main thread) pushes a `Decision` through the channel.  The stream never
-leaves its thread — no `set_nonblocking` + `from_std` dance at decision time.
+leaves its thread: only the `Decision` travels, never the socket.
 
 #### Decision enum
 
@@ -122,6 +122,13 @@ enum Decision {
 - Pure Rust — no external `nc` dependency.
 - The `handle_connection` thread builds a single-threaded tokio runtime
   inline and calls `block_on(tunnel(...))`.  One OS thread per active tunnel.
+- `tokio::net::TcpStream::from_std()` **requires** a nonblocking fd — tokio
+  debug-asserts this when the socket is registered (see tokio's
+  `check_socket_for_blocking`; a blocking fd would also block the whole
+  single-threaded runtime).  The connection thread therefore calls
+  `stream.set_nonblocking(true)` right before handing the socket over.
+  The stream still stays on its own thread — only the fd's blocking mode
+  changes.
 - `TcpStream::into_split()` splits client and upstream each into read/write
   halves.  Two `tokio::spawn` tasks copy concurrently with proper TCP
   half-close via `shutdown()`.
