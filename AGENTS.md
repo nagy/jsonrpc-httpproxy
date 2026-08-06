@@ -140,7 +140,7 @@ JSON-RPC 2.0 error codes:
 | `-32700` | `PARSE_ERROR`     | stdin line is not valid JSON                  |
 | `-32600` | `INVALID_REQUEST` | `jsonrpc` field is not `"2.0"`                |
 | `-32601` | `METHOD_NOT_FOUND`| unknown method name                          |
-| `-32602` | `INVALID_PARAMS`  | wrong param type, unknown connection id      |
+| `-32602` | `INVALID_PARAMS`  | wrong param type, unknown connection id, port out of range |
 
 Two tiny helpers validate parameters:
 
@@ -176,14 +176,25 @@ line, headers, and body.
 |---------|---------|----------------------|
 | `PORT`  | `3128`  | TCP listen port      |
 
-Bind address is hardcoded to `127.0.0.1`.
+Bind address is hardcoded to `127.0.0.1`.  An unparsable `PORT` (e.g.
+`PORT=abc`) panics in `server_thread()`.
 
-Log level via `RUST_LOG` (uses `colog` → `env_logger`).
+Log level defaults to Info; override via `RUST_LOG` (uses `colog` →
+`env_logger`).  `debug!` output (e.g. the JSON-RPC request dump) requires
+`RUST_LOG=debug`.
 
 ## Build & run
 
+Run all commands inside a nix shell (`shell.nix` provides cargo, rustc,
+rustfmt, clippy) — either enter it with `nix-shell` or prefix the command:
+
 ```bash
-cargo build
+nix-shell --run 'cargo build'
+```
+
+To smoke-test from stdin (run inside the nix shell):
+
+```bash
 echo '{"jsonrpc":"2.0","id":1,"method":"accept","params":[0,"example.com",443]}' \
   | ./target/debug/jsonrpc-httpproxy
 ```
@@ -196,17 +207,28 @@ nix-build default.nix   # or: nix build
 
 1. ~~**No timeout on pending connections**~~ — resolved: client read has 5 s
    timeout (→ 408), controller decision has 30 s timeout (→ 504).
-2. **Two threads write to stdout** (connection threads for notifications,
-   main thread for responses). Line-delimited JSON usually survives
-   interleaving, but a single-writer mpsc channel would be safer.
+2. **Every connection thread writes to stdout** — one `println!` notification
+   per connection thread, plus the main thread's responses: N+1 writers.
+   Individual lines are not torn (all writers go through the process-wide
+   stdout lock), but notification/response *ordering* is arbitrary, so a
+   controller must correlate by `connection_id` / `id`. A single-writer mpsc
+   channel would be safer.
 3. **SIGINT handler doesn't drain** — it calls `process::exit(0)` to avoid
    potential deadlock on the `GLOBAL_MAP` mutex.  Clients get TCP RST instead
    of a graceful 502.  The JSON-RPC `shutdown` method *does* drain gracefully.
-4. **`accept-file` and `deny` throw away leftover bytes** — if the client sent
-   data after its request line on a GET or a denied CONNECT, those bytes are
-   silently dropped.
+4. **`accept-file`, `deny`, and the 504-timeout path throw away leftover
+   bytes** — if the client sent data after its request line on a GET or a
+   denied CONNECT, those bytes are silently dropped. (On `accept` they are
+   forwarded to upstream.)
 5. **One OS thread per connection + one tokio runtime per tunnel** — fine for
    low-volume use; a full async rewrite with a shared tokio runtime would be
    needed for hundreds of concurrent connections.
 6. **Blocking `std::fs::read` in `accept-file`** — blocks the connection
    thread while reading the file.
+7. **`accept` on a GET connection tunnels the raw request** — the dispatcher
+   does not track whether a connection was CONNECT or GET, so `accept` on a
+   `gethttp` connection forwards the GET request line and headers verbatim to
+   the given host:port. Only `accept-file` and `deny` are meaningful for GET.
+8. **A few `unwrap()`s can panic on malformed input** — an unparsable `PORT`,
+   a CONNECT target without `host:port`, and a failed `accept()` on the
+   listener (`expect`, kills `server_thread`).
