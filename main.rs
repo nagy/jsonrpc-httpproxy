@@ -15,6 +15,11 @@ use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::Duration;
 
+/// Write an HTTP/1.1 response (head + body) to `wtr`.
+///
+/// # Errors
+///
+/// Returns an I/O error if writing the head or body fails.
 pub fn write_http11<W: std::io::Write, T: Into<Vec<u8>>>(
     wtr: &mut W,
     response: http::Response<T>,

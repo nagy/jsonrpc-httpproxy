@@ -3,6 +3,13 @@ name = "jsonrpc-httpproxy"
 version = "0.1.0"
 edition = "2024"
 
+[lints.clippy]
+# Run pedantic by default (no `-W clippy::pedantic` needed). `main()` (the
+# stdin JSON-RPC loop) and `handle_connection` (the per-connection routing)
+# are single long functions; splitting them for a ~20-line overflow is churn.
+pedantic = { level = "warn", priority = -1 }
+too_many_lines = "allow"
+
 [dependencies]
 colog = "1.4.0"
 ctrlc = "3"
