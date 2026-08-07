@@ -172,6 +172,11 @@ client may have disconnected).
 thread.  It also ignores I/O errors — if stdout is broken the proxy is
 unusable anyway.
 
+Controller notifications (`want`/`gethttp`) also flush stdout explicitly.
+Without the flush, `println!` on a redirected stdout (e.g. in the VM test)
+is block-buffered and the notification would sit in the buffer, so a
+controller reading stdout line-by-line would never see it promptly.
+
 ### HTTP response writer (`write_http11`)
 
 Generic over `W: Write`. Handles both HTTP/1.0 and HTTP/1.1 with status
@@ -210,6 +215,36 @@ echo '{"jsonrpc":"2.0","id":1,"method":"accept","params":[0,"example.com",443]}'
 nix-build default.nix   # or: nix build
 ```
 
+### VM integration test
+
+`default.nix` carries a NixOS VM integration test (`passthru.tests`)
+that exercises the full controller protocol end-to-end, with no internet
+access:
+
+```bash
+nix-build -A passthru.tests.jsonrpc-httpproxy
+```
+
+The test boots a VM, starts the proxy (debug build, so tokio's
+debug_assert!s run) with its controller interface fed by
+`tail -f /tmp/cmds | jsonrpc-httpproxy`, serves darkhttpd's own source
+tree locally as the upstream, and runs four subtests that drive the proxy
+like a real controller would (JSON-RPC commands appended to `/tmp/cmds`,
+notifications + responses read from `/tmp/proxy.log`):
+
+1. **CONNECT tunnel (accept)** — real client CONNECT, `accept` decision,
+   `200 Connection Established`, GET through the tunnel returns `200 OK`
+2. **GET + accept-file** — `gethttp` notification, `accept-file` decision,
+   curl gets the file
+3. **deny** — `deny` decision, client gets `403 Forbidden`
+4. **shutdown drain** — pending connection gets a graceful `502 Bad
+   Gateway`, proxy exits
+
+The proxy scripts live in `default.nix` as `writeText` derivations and are
+copied into the VM. The test runs against a DEBUG build so debug_assert!s
+(e.g. tokio's `check_socket_for_blocking`) are exercised; the main build
+stays release.
+
 ## Known limitations / future work
 
 1. ~~**No timeout on pending connections**~~ — resolved: client read has 5 s
@@ -222,7 +257,9 @@ nix-build default.nix   # or: nix build
    channel would be safer.
 3. **SIGINT handler doesn't drain** — it calls `process::exit(0)` to avoid
    potential deadlock on the `GLOBAL_MAP` mutex.  Clients get TCP RST instead
-   of a graceful 502.  The JSON-RPC `shutdown` method *does* drain gracefully.
+   of a graceful 502.  The JSON-RPC `shutdown` method *does* drain gracefully
+   (it sleeps 500 ms after notifying channels so the connection threads can
+   write their 502s before `process::exit`).
 4. **`accept-file`, `deny`, and the 504-timeout path throw away leftover
    bytes** — if the client sent data after its request line on a GET or a
    denied CONNECT, those bytes are silently dropped. (On `accept` they are

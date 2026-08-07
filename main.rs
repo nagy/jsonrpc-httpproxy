@@ -10,7 +10,7 @@ use std::io::prelude::*;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -54,9 +54,8 @@ enum Decision {
     Shutdown,
 }
 
-static GLOBAL_MAP: LazyLock<Mutex<HashMap<u64, SyncSender<Decision>>>> = LazyLock::new(|| {
-    Mutex::new(HashMap::new())
-});
+static GLOBAL_MAP: LazyLock<Mutex<HashMap<u64, SyncSender<Decision>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // ── tokio-based CONNECT tunnel ───────────────────────────────────────────
 
@@ -183,17 +182,13 @@ impl JsonRpcError {
 
 fn require_u64(val: &serde_json::Value, pos: usize) -> Result<u64, JsonRpcError> {
     val.as_u64().ok_or_else(|| {
-        JsonRpcError::invalid_params(format!(
-            "param {pos}: expected number, got {val}"
-        ))
+        JsonRpcError::invalid_params(format!("param {pos}: expected number, got {val}"))
     })
 }
 
 fn require_str(val: &serde_json::Value, pos: usize) -> Result<&str, JsonRpcError> {
     val.as_str().ok_or_else(|| {
-        JsonRpcError::invalid_params(format!(
-            "param {pos}: expected string, got {val}"
-        ))
+        JsonRpcError::invalid_params(format!("param {pos}: expected string, got {val}"))
     })
 }
 
@@ -269,6 +264,10 @@ fn main() {
                 tx.send(Decision::Shutdown).ok();
             }
             info!("all pending connections notified, exiting");
+            // Wait for the connection threads to write their 502s before
+            // exiting. `process::exit` would kill them mid-write, leaving
+            // clients with a TCP RST instead of the graceful 502.
+            thread::sleep(Duration::from_millis(500));
             std::process::exit(0);
         }
 
@@ -443,7 +442,15 @@ fn handle_connection(mut stream: TcpStream) {
 
     let (tx, rx) = sync_channel(1);
     GLOBAL_MAP.lock().unwrap().insert(current_count, tx);
-    println!("{value}"); // notify controller *after* inserting into map
+    // Notify the controller *after* inserting into the map. Flush explicitly:
+    // stdout is block-buffered when redirected (as in the VM test), so
+    // without a flush the notification would sit in the buffer and the
+    // controller would never see it promptly.
+    {
+        let mut lock = std::io::stdout().lock();
+        let _ = writeln!(lock, "{value}");
+        let _ = lock.flush();
+    }
 
     match rx.recv_timeout(Duration::from_secs(30)) {
         Ok(Decision::Accept { host, port }) => {
