@@ -232,18 +232,22 @@ tree locally as the upstream, and runs four subtests that drive the proxy
 like a real controller would (JSON-RPC commands appended to `/tmp/cmds`,
 notifications + responses read from `/tmp/proxy.log`):
 
-1. **CONNECT tunnel (accept)** — real client CONNECT, `accept` decision,
-   `200 Connection Established`, GET through the tunnel returns `200 OK`
+1. **CONNECT tunnel (accept)** — curl `--proxytunnel` CONNECTs through the
+   proxy, `accept` decision, `200 Connection Established`, GET through the
+   tunnel returns `200 OK`
 2. **GET + accept-file** — `gethttp` notification, `accept-file` decision,
    curl gets the file
-3. **deny** — `deny` decision, client gets `403 Forbidden`
+3. **deny** — `deny` decision, curl gets `403 Forbidden`
 4. **shutdown drain** — pending connection gets a graceful `502 Bad
    Gateway`, proxy exits
 
-The proxy scripts live in `default.nix` as `writeText` derivations and are
-copied into the VM. The test runs against a DEBUG build so debug_assert!s
-(e.g. tokio's `check_socket_for_blocking`) are exercised; the main build
-stays release.
+The client side uses `curl` (real HTTP semantics); the controller side is
+a Python driver (`proxy-driver.py`, a `writeText` derivation copied into
+the VM) that plays the controller: it waits for the proxy's notification
+in the log, appends the matching JSON-RPC decision to `/tmp/cmds`, and
+asserts the documented protocol. The test runs against a DEBUG build so
+debug_assert!s (e.g. tokio's `check_socket_for_blocking`) are exercised;
+the main build stays release.
 
 ## Known limitations / future work
 
