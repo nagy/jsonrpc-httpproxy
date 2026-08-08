@@ -217,7 +217,9 @@ nix-build default.nix   # or: nix build
 
 ### VM integration test
 
-`default.nix` carries a NixOS VM integration test (`passthru.tests`)
+`test/default.nix` carries a NixOS VM integration test, wired into the
+package via `passthru.tests` in `default.nix`. It exercises the full
+controller protocol end-to-end, with no internet access:
 that exercises the full controller protocol end-to-end, with no internet
 access:
 
