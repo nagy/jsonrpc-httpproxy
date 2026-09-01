@@ -1,19 +1,22 @@
-use http::StatusCode;
-use http::Version;
-use http::header::CONTENT_LENGTH;
-use http::header::CONTENT_TYPE;
+use std::{
+    collections::HashMap,
+    io::{BufRead, prelude::*},
+    net::{TcpListener, TcpStream},
+    sync::{
+        LazyLock, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{RecvTimeoutError, SyncSender, sync_channel},
+    },
+    thread,
+    time::Duration,
+};
+
+use http::{
+    StatusCode, Version,
+    header::{CONTENT_LENGTH, CONTENT_TYPE},
+};
 use log::{debug, error, info};
 use serde_json::json;
-use std::collections::HashMap;
-use std::io::BufRead;
-use std::io::prelude::*;
-use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
-use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
-use std::sync::{LazyLock, Mutex};
-use std::thread;
-use std::time::Duration;
 
 /// Write an HTTP/1.1 response (head + body) to `wtr`.
 ///

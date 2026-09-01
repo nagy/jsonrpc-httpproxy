@@ -204,6 +204,10 @@ rustfmt, clippy) — either enter it with `nix-shell` or prefix the command:
 nix-shell --run 'cargo build'
 ```
 
+`rustfmt.toml` (from rkyv, `max_width = 100`) — the unstable options
+(`imports_granularity = "Crate"`, `group_imports = "StdExternalCrate"`) need
+`rustfmt --edition 2024 --config 'imports_granularity=Crate,group_imports=StdExternalCrate'`.
+
 To smoke-test from stdin (run inside the nix shell):
 
 ```bash
