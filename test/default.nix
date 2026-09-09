@@ -1,4 +1,8 @@
-{ pkgs ? import <nixpkgs> { }, lib ? pkgs.lib, jsonrpc-httpproxy }:
+{
+  pkgs ? import <nixpkgs> { },
+  lib ? pkgs.lib,
+  jsonrpc-httpproxy,
+}:
 let
   nixos-lib = import (pkgs.path + "/nixos/lib") { inherit (pkgs) lib; };
 
@@ -189,9 +193,9 @@ nixos-lib.runTest {
     { pkgs, ... }:
     {
       environment.systemPackages = [
-        # Run the VM test against a DEBUG build so debug_assert!s
+        # The caller passes a DEBUG build so debug_assert!s
         # (e.g. tokio's check_socket_for_blocking) are exercised.
-        (jsonrpc-httpproxy.overrideAttrs { cargoBuildType = "debug"; })
+        jsonrpc-httpproxy
         pkgs.curl
         pkgs.python3
       ];

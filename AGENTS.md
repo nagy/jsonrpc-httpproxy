@@ -197,18 +197,22 @@ Log level defaults to Info; override via `RUST_LOG` (uses `colog` →
 
 ## Build & run
 
-Run all commands inside a nix shell (`shell.nix` provides cargo, rustc,
-rustfmt, clippy) — either enter it with `nix-shell` or prefix the command:
+The repo is a nix flake (`flake.nix`, flake-parts + crane + treefmt-nix).
+Enter the dev shell (cargo, rustc, clippy, rustfmt, treefmt) and run cargo
+inside it:
 
 ```bash
-nix-shell --run 'cargo build'
+nix develop -c cargo build
+# or interactively:
+nix develop
 ```
 
-`rustfmt.toml` (from rkyv, `max_width = 100`) — the unstable options
-(`imports_granularity = "Crate"`, `group_imports = "StdExternalCrate"`) need
-`rustfmt --edition 2024 --config 'imports_granularity=Crate,group_imports=StdExternalCrate'`.
+Formatting config lives in `flake.nix` under `treefmt` (no `rustfmt.toml`
+in the repo). Format everything with `nix fmt` — treefmt drives nixfmt,
+rustfmt (unstable options like `imports_granularity = "Crate"`,
+`group_imports = "StdExternalCrate"`), and taplo.
 
-To smoke-test from stdin (run inside the nix shell):
+To smoke-test from stdin (run inside the dev shell):
 
 ```bash
 echo '{"jsonrpc":"2.0","id":1,"method":"accept","params":[0,"example.com",443]}' \
@@ -216,19 +220,23 @@ echo '{"jsonrpc":"2.0","id":1,"method":"accept","params":[0,"example.com",443]}'
 ```
 
 ```bash
-nix-build default.nix   # or: nix build
+nix build               # release package (result/bin/jsonrpc-httpproxy)
+nix flake check         # cargo tests + treefmt check + the VM test below
 ```
 
 ### VM integration test
 
 `test/default.nix` carries a NixOS VM integration test, wired into the
-package via `passthru.tests` in `default.nix`. It exercises the full
-controller protocol end-to-end, with no internet access:
-that exercises the full controller protocol end-to-end, with no internet
-access:
+flake as `checks.jsonrpc-httpproxy-vm` (crane builds a separate DEBUG
+package for it — `env.CARGO_PROFILE = "dev"` with its own
+`buildDepsOnly` artifacts — so tokio's debug_assert!s run while the main
+build stays release). It exercises the full controller protocol
+end-to-end, with no internet access:
 
 ```bash
-nix-build -A passthru.tests.jsonrpc-httpproxy
+nix build .#checks.x86_64-linux.jsonrpc-httpproxy-vm
+# or everything at once (slower):
+nix flake check
 ```
 
 The test boots a VM, starts the proxy (debug build, so tokio's
