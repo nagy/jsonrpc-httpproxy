@@ -46,6 +46,23 @@
             inherit src;
           };
 
+          # Static rustdoc HTML (what `cargo doc` writes to ./target/doc/)
+          # installed under $out/share/doc. Reuses the same cargoArtifacts,
+          # so only doc crates compile; --no-deps (crane's default) keeps
+          # third-party crates out of the search index. Same arg set as
+          # checks.default (pure Rust: just src + cargoArtifacts).
+          docs = craneLib.cargoDoc {
+            inherit src cargoArtifacts;
+            meta.description = "API documentation for the JSON-RPC-controlled HTTP proxy";
+          };
+
+          # Doctests: code blocks in doc comments compiled and run against
+          # the library (`cargo test --doc`), same artifact set as above.
+          doctests = craneLib.cargoDocTest {
+            inherit src cargoArtifacts;
+            meta.description = "Doctests for the JSON-RPC-controlled HTTP proxy";
+          };
+
           pkg = craneLib.buildPackage {
             inherit src cargoArtifacts;
             meta = {
@@ -71,22 +88,38 @@
             inherit src;
             cargoArtifacts = cargoArtifactsDebug;
             env.CARGO_PROFILE = "dev";
+            meta.description = "JSON-RPC-controlled HTTP/HTTPS intercepting proxy (debug build)";
           };
 
           # NixOS VM integration test: drives the controller protocol end
           # to end. It is fed the debug build on purpose (see above).
-          vmTest = import ./test/default.nix {
-            inherit pkgs lib;
-            jsonrpc-httpproxy = pkg-debug;
-          };
+          # nixos-lib supplies the rest of meta (platforms, timeout); add
+          # a description on top so the derivation follows house style.
+          vmTest =
+            let
+              test = import ./test/default.nix {
+                inherit pkgs lib;
+                jsonrpc-httpproxy = pkg-debug;
+              };
+            in
+            test
+            // {
+              meta = test.meta // {
+                description = "NixOS VM integration test for the JSON-RPC-controlled HTTP proxy";
+              };
+            };
         in
         {
           packages.jsonrpc-httpproxy = pkg;
           packages.default = config.packages.jsonrpc-httpproxy;
+          packages.jsonrpc-httpproxy-doc = docs;
 
           checks.default = craneLib.cargoTest {
             inherit src cargoArtifacts;
+            meta.description = "JSON-RPC-controlled HTTP/HTTPS intercepting proxy test suite";
           };
+
+          checks.doctests = doctests;
 
           # Runs the full NixOS VM test (boots a VM, so it is slow —
           # run it alone via `nix build .#checks.x86_64-linux.jsonrpc-httpproxy-vm`).

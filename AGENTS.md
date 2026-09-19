@@ -221,7 +221,12 @@ echo '{"jsonrpc":"2.0","id":1,"method":"accept","params":[0,"example.com",443]}'
 
 ```bash
 nix build               # release package (result/bin/jsonrpc-httpproxy)
-nix flake check         # cargo tests + treefmt check + the VM test below
+nix flake check         # cargo tests + doctests + treefmt check + the VM test below
+nix build .#jsonrpc-httpproxy-doc  # static rustdoc HTML
+
+Doctests run as `checks.doctests` (`cargo test --doc`); the crate has a
+lib target pointing at the shared `main.rs` (`[lib] path = "main.rs"`),
+so no separate lib file is tracked.
 ```
 
 ### VM integration test

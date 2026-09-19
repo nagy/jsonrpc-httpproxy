@@ -20,6 +20,15 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.145", features = ["preserve_order"] }
 tokio = { version = "1", features = ["net", "rt", "io-util"] }
 
+# Library target: the whole program is one source file, shared by the lib
+# and bin targets. The lib is needed for `cargo doc` and `cargo test --doc`,
+# which fail with "no library targets found" on a bin-only crate.
+[lib]
+path = "main.rs"
+
 [[bin]]
 name = "jsonrpc-httpproxy"
 path = "main.rs"
+# The bin would overwrite the lib docs under target/doc/<crate>/ (same
+# crate name); the library docs are the ones we ship.
+doc = false

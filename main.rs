@@ -1,3 +1,9 @@
+//! JSON-RPC-controlled HTTP/HTTPS intercepting proxy.
+//!
+//! Accepts client connections but defers all routing decisions to an
+//! external controller process via line-delimited JSON-RPC over
+//! stdin/stdout; see `AGENTS.md` for the full protocol.
+
 use std::{
     collections::HashMap,
     io::{BufRead, prelude::*},
@@ -20,9 +26,37 @@ use serde_json::json;
 
 /// Write an HTTP/1.1 response (head + body) to `wtr`.
 ///
+/// Emits a `<version> <code> <reason>` status line, one `Name: value`
+/// line per header, a blank line, then the body — all with CRLF line
+/// endings (`writeln!`'s `\n` plus the explicit `\r` in the format
+/// strings).
+///
 /// # Errors
 ///
 /// Returns an I/O error if writing the head or body fails.
+///
+/// # Examples
+///
+/// Pin the exact wire format, including the CRLF endings and the
+/// lowercased header name:
+///
+/// ```
+/// use http::{Response, StatusCode, Version};
+/// use jsonrpc_httpproxy::write_http11;
+///
+/// let response = Response::builder()
+///     .version(Version::HTTP_11)
+///     .status(StatusCode::OK)
+///     .header("Content-Type", "text/plain")
+///     .body("hi")
+///     .unwrap();
+/// let mut buf: Vec<u8> = Vec::new();
+/// write_http11(&mut buf, response).unwrap();
+/// assert_eq!(
+///     buf,
+///     b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\r\nhi"
+/// );
+/// ```
 pub fn write_http11<W: std::io::Write, T: Into<Vec<u8>>>(
     wtr: &mut W,
     response: http::Response<T>,
@@ -46,26 +80,31 @@ pub fn write_http11<W: std::io::Write, T: Into<Vec<u8>>>(
 
 // ── connection state ─────────────────────────────────────────────────────
 
-/// A tiny channel handle is parked in the global map instead of the full
-/// `TcpStream`.  The connection thread keeps the stream and blocks on the
-/// receiver until the controller sends a decision.
+/// A decision the controller reaches for a pending connection.
+///
+/// A tiny channel handle is parked in the global map instead of the
+/// full `TcpStream`.  The connection thread keeps the stream and blocks
+/// on the receiver until the controller sends a decision.
 #[derive(Debug)]
-enum Decision {
+pub enum Decision {
     Accept { host: String, port: u16 },
     AcceptFile { path: String, mimetype: String },
     Deny,
     Shutdown,
 }
 
-static GLOBAL_MAP: LazyLock<Mutex<HashMap<u64, SyncSender<Decision>>>> =
+/// Pending connections: connection id → decision channel.
+pub static GLOBAL_MAP: LazyLock<Mutex<HashMap<u64, SyncSender<Decision>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // ── tokio-based CONNECT tunnel ───────────────────────────────────────────
 
 /// Bidirectional tunnel between client and upstream, powered by tokio.
-/// Writes `leftover` (bytes already read from the client past the CONNECT
-/// line) to upstream first, then copies both directions concurrently.
-async fn tunnel(
+///
+/// Writes `leftover` (bytes already read from the client past the
+/// CONNECT line) to upstream first, then copies both directions
+/// concurrently.
+pub async fn tunnel(
     client: tokio::net::TcpStream,
     host: &str,
     port: u16,
@@ -101,7 +140,8 @@ async fn tunnel(
 
 // ── response helpers (called from the connection thread) ─────────────────
 
-fn send_502(stream: &mut TcpStream) {
+/// Send a `502 Bad Gateway` response, used when the proxy shuts down.
+pub fn send_502(stream: &mut TcpStream) {
     let body = "proxy shutting down";
     let res = http::Response::builder()
         .version(Version::HTTP_11)
@@ -113,7 +153,8 @@ fn send_502(stream: &mut TcpStream) {
     write_http11(stream, res).ok();
 }
 
-fn deny_connection(stream: &mut TcpStream) {
+/// Respond `403 Forbidden` to the client.
+pub fn deny_connection(stream: &mut TcpStream) {
     let reason = StatusCode::FORBIDDEN
         .canonical_reason()
         .unwrap_or("Unknown Reason");
@@ -127,7 +168,8 @@ fn deny_connection(stream: &mut TcpStream) {
     write_http11(stream, res).ok();
 }
 
-fn serve_file(stream: &mut TcpStream, path: &str, mimetype: &str) {
+/// Serve a local file as an HTTP 200 response, or `404` if unreadable.
+pub fn serve_file(stream: &mut TcpStream, path: &str, mimetype: &str) {
     if let Ok(filestr) = std::fs::read(path) {
         let res = http::Response::builder()
             .version(Version::HTTP_10)
@@ -154,28 +196,52 @@ fn serve_file(stream: &mut TcpStream, path: &str, mimetype: &str) {
 
 // ── JSON-RPC error handling ──────────────────────────────────────────────
 
+/// A JSON-RPC 2.0 error object: standard `code` plus a human message.
 #[derive(Debug, serde::Serialize)]
-struct JsonRpcError {
-    code: i64,
-    message: String,
+pub struct JsonRpcError {
+    /// One of the JSON-RPC 2.0 error codes, see the constants below.
+    pub code: i64,
+    /// Human-readable description sent back to the controller.
+    pub message: String,
 }
 
-#[allow(dead_code)]
 impl JsonRpcError {
-    const PARSE_ERROR: i64 = -32700;
-    const INVALID_REQUEST: i64 = -32600;
-    const METHOD_NOT_FOUND: i64 = -32601;
-    const INVALID_PARAMS: i64 = -32602;
-    const INTERNAL_ERROR: i64 = -32603;
+    /// A stdin line was not valid JSON (`-32700`).
+    pub const PARSE_ERROR: i64 = -32700;
 
-    fn method_not_found(method: &str) -> Self {
+    /// The `jsonrpc` member was not `"2.0"` (`-32600`).
+    pub const INVALID_REQUEST: i64 = -32600;
+
+    /// Unknown method name (`-32601`).
+    pub const METHOD_NOT_FOUND: i64 = -32601;
+
+    /// Bad param type, unknown connection id, or out-of-range port
+    /// (`-32602`).
+    pub const INVALID_PARAMS: i64 = -32602;
+
+    /// Reserved by JSON-RPC 2.0; currently unused (`-32603`).
+    pub const INTERNAL_ERROR: i64 = -32603;
+
+    /// Build a `METHOD_NOT_FOUND` error for an unknown method.
+    pub fn method_not_found(method: &str) -> Self {
         JsonRpcError {
             code: Self::METHOD_NOT_FOUND,
             message: format!("unknown method: {method}"),
         }
     }
 
-    fn invalid_params(msg: impl Into<String>) -> Self {
+    /// Build an `INVALID_PARAMS` error from a message.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use jsonrpc_httpproxy::JsonRpcError;
+    ///
+    /// let err = JsonRpcError::invalid_params("param 1: expected number");
+    /// assert_eq!(err.code, JsonRpcError::INVALID_PARAMS);
+    /// assert_eq!(err.message, "param 1: expected number");
+    /// ```
+    pub fn invalid_params(msg: impl Into<String>) -> Self {
         JsonRpcError {
             code: Self::INVALID_PARAMS,
             message: msg.into(),
@@ -183,13 +249,49 @@ impl JsonRpcError {
     }
 }
 
-fn require_u64(val: &serde_json::Value, pos: usize) -> Result<u64, JsonRpcError> {
+/// Extract a `u64` from a JSON-RPC params array element.
+///
+/// # Errors
+///
+/// Returns `INVALID_PARAMS` (`-32602`) when the value is not an
+/// unsigned integer — strings and negatives are rejected, not parsed.
+///
+/// # Examples
+///
+/// ```
+/// use jsonrpc_httpproxy::require_u64;
+/// use serde_json::json;
+///
+/// assert_eq!(require_u64(&json!(5), 1).unwrap(), 5);
+/// assert_eq!(require_u64(&json!(0), 1).unwrap(), 0);
+/// assert!(require_u64(&json!("5"), 1).is_err());
+/// assert!(require_u64(&json!(-5), 1).is_err());
+/// ```
+pub fn require_u64(val: &serde_json::Value, pos: usize) -> Result<u64, JsonRpcError> {
     val.as_u64().ok_or_else(|| {
         JsonRpcError::invalid_params(format!("param {pos}: expected number, got {val}"))
     })
 }
 
-fn require_str(val: &serde_json::Value, pos: usize) -> Result<&str, JsonRpcError> {
+/// Extract a string slice from a JSON-RPC params array element.
+///
+/// # Errors
+///
+/// Returns `INVALID_PARAMS` (`-32602`) when the value is not a string.
+///
+/// # Examples
+///
+/// ```
+/// use jsonrpc_httpproxy::require_str;
+/// use serde_json::json;
+///
+/// assert_eq!(
+///     require_str(&json!("example.com"), 2).unwrap(),
+///     "example.com"
+/// );
+/// assert!(require_str(&json!(42), 2).is_err());
+/// ```
+pub fn require_str(val: &serde_json::Value, pos: usize) -> Result<&str, JsonRpcError> {
     val.as_str().ok_or_else(|| {
         JsonRpcError::invalid_params(format!("param {pos}: expected string, got {val}"))
     })
@@ -197,21 +299,42 @@ fn require_str(val: &serde_json::Value, pos: usize) -> Result<&str, JsonRpcError
 
 // ── JSON-RPC control loop ────────────────────────────────────────────────
 
+/// A controller request line as parsed from stdin.
+///
+/// The wire format is single-line JSON-RPC 2.0 with a numeric `id` and
+/// an array `params`.
+///
+/// # Examples
+///
+/// ```
+/// use jsonrpc_httpproxy::JsonRPCRequest;
+///
+/// let req: JsonRPCRequest = serde_json::from_str(
+///     r#"{"jsonrpc":"2.0","id":7,"method":"accept","params":[3,"example.com",443]}"#,
+/// )
+/// .unwrap();
+/// assert_eq!(req.id, 7);
+/// assert_eq!(req.method, "accept");
+/// assert_eq!(req.params.len(), 3);
+/// ```
 #[derive(Debug, serde::Deserialize)]
-struct JsonRPCRequest {
+pub struct JsonRPCRequest {
     pub jsonrpc: String,
     pub id: u64,
     pub method: String,
     pub params: Vec<serde_json::Value>,
 }
 
-fn send_response(response: &serde_json::Value) {
+/// Write a JSON-RPC response (or error) object to stdout as one line.
+pub fn send_response(response: &serde_json::Value) {
     let mut lock = std::io::stdout().lock();
     let _ = writeln!(lock, "{}", serde_json::to_string(response).unwrap());
     let _ = lock.flush();
 }
 
-fn main() {
+/// Entry point: start the server thread, then run the stdin JSON-RPC
+/// control loop.
+pub fn main() {
     colog::init();
 
     ctrlc::set_handler(|| {
@@ -356,7 +479,8 @@ fn main() {
 
 // ── server ───────────────────────────────────────────────────────────────
 
-fn server_thread() -> Result<(), Box<dyn std::error::Error>> {
+/// Accept client connections and spawn a handler thread per connection.
+pub fn server_thread() -> Result<(), Box<dyn std::error::Error>> {
     let port: u16 = std::env::var("PORT")
         .unwrap_or("3128".into())
         .parse()
@@ -370,7 +494,11 @@ fn server_thread() -> Result<(), Box<dyn std::error::Error>> {
     unreachable!();
 }
 
-fn handle_connection(mut stream: TcpStream) {
+/// Handle one client connection from accept to close.
+///
+/// Parses the first request, asks the controller, then acts on the
+/// decision.
+pub fn handle_connection(mut stream: TcpStream) {
     static GLOBAL_COUNTER: AtomicU64 = AtomicU64::new(0);
     let current_count = GLOBAL_COUNTER.fetch_add(1, Ordering::SeqCst);
     info!("New connection established number: {current_count}");
