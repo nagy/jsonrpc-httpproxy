@@ -198,13 +198,8 @@ Log level defaults to Info; override via `RUST_LOG` (uses `colog` →
 ## Build & run
 
 The repo is a nix flake (`flake.nix`, flake-parts + crane + treefmt-nix).
-Enter the dev shell (cargo, rustc, clippy, rustfmt, treefmt) and run cargo
-inside it:
-
 ```bash
-nix develop -c cargo build
-# or interactively:
-nix develop
+cargo build
 ```
 
 Formatting config lives in `flake.nix` under `treefmt` (no `rustfmt.toml`
@@ -212,7 +207,7 @@ in the repo). Format everything with `nix fmt` — treefmt drives nixfmt,
 rustfmt (unstable options like `imports_granularity = "Crate"`,
 `group_imports = "StdExternalCrate"`), and taplo.
 
-To smoke-test from stdin (run inside the dev shell):
+To smoke-test from stdin:
 
 ```bash
 echo '{"jsonrpc":"2.0","id":1,"method":"accept","params":[0,"example.com",443]}' \
