@@ -121,6 +121,23 @@ pub enum Decision {
 pub static GLOBAL_MAP: LazyLock<Mutex<HashMap<u64, SyncSender<Decision>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+// ── HTTP response construction ───────────────────────────────────────────
+
+/// Build a plain-text response with the given status and body.
+fn plain_response(
+    version: Version,
+    status: StatusCode,
+    body: &'static str,
+) -> http::Response<&'static str> {
+    http::Response::builder()
+        .version(version)
+        .status(status)
+        .header(CONTENT_LENGTH, body.len())
+        .header(CONTENT_TYPE, "text/plain")
+        .body(body)
+        .expect("plain-text response builder cannot fail")
+}
+
 // ── tokio-based CONNECT tunnel ───────────────────────────────────────────
 
 /// Bidirectional tunnel between client and upstream, powered by tokio.
@@ -128,6 +145,15 @@ pub static GLOBAL_MAP: LazyLock<Mutex<HashMap<u64, SyncSender<Decision>>>> =
 /// Writes `leftover` (bytes already read from the client past the
 /// CONNECT line) to upstream first, then copies both directions
 /// concurrently.
+///
+/// # Errors
+///
+/// Returns an error if the upstream connection fails, if the leftover
+/// bytes cannot be written, or if spawning a copy task fails.
+///
+/// # Panics
+///
+/// Panics if a copy task panics while it is joined.
 pub async fn tunnel(
     client: tokio::net::TcpStream,
     host: &str,
@@ -166,14 +192,11 @@ pub async fn tunnel(
 
 /// Send a `502 Bad Gateway` response, used when the proxy shuts down.
 pub fn send_502(stream: &mut TcpStream) {
-    let body = "proxy shutting down";
-    let res = http::Response::builder()
-        .version(Version::HTTP_11)
-        .status(StatusCode::BAD_GATEWAY)
-        .header(CONTENT_LENGTH, body.len())
-        .header(CONTENT_TYPE, "text/plain")
-        .body(body)
-        .unwrap();
+    let res = plain_response(
+        Version::HTTP_11,
+        StatusCode::BAD_GATEWAY,
+        "proxy shutting down",
+    );
     write_http11(stream, res).ok();
 }
 
@@ -182,17 +205,16 @@ pub fn deny_connection(stream: &mut TcpStream) {
     let reason = StatusCode::FORBIDDEN
         .canonical_reason()
         .unwrap_or("Unknown Reason");
-    let res = http::Response::builder()
-        .version(Version::HTTP_10)
-        .status(StatusCode::FORBIDDEN)
-        .header(CONTENT_LENGTH, reason.len())
-        .header(CONTENT_TYPE, "text/plain")
-        .body(reason)
-        .unwrap();
+    let res = plain_response(Version::HTTP_10, StatusCode::FORBIDDEN, reason);
     write_http11(stream, res).ok();
 }
 
 /// Serve a local file as an HTTP 200 response, or `404` if unreadable.
+///
+/// # Panics
+///
+/// Panics if the HTTP response builder rejects the hardcoded status or
+/// body.
 pub fn serve_file(stream: &mut TcpStream, path: &str, mimetype: &str) {
     if let Ok(filestr) = std::fs::read(path) {
         let res = http::Response::builder()
@@ -201,19 +223,13 @@ pub fn serve_file(stream: &mut TcpStream, path: &str, mimetype: &str) {
             .header(CONTENT_LENGTH, filestr.len())
             .header(CONTENT_TYPE, mimetype)
             .body(filestr)
-            .unwrap();
+            .expect("file response builder cannot fail");
         write_http11(stream, res).ok();
     } else {
         let reason = StatusCode::NOT_FOUND
             .canonical_reason()
             .unwrap_or("Unknown Reason");
-        let res = http::Response::builder()
-            .version(Version::HTTP_10)
-            .status(StatusCode::NOT_FOUND)
-            .header(CONTENT_LENGTH, reason.len())
-            .header(CONTENT_TYPE, "text/plain")
-            .body(reason)
-            .unwrap();
+        let res = plain_response(Version::HTTP_10, StatusCode::NOT_FOUND, reason);
         write_http11(stream, res).ok();
     }
 }
@@ -352,14 +368,26 @@ pub struct JsonRPCRequest {
 }
 
 /// Write a JSON-RPC response (or error) object to stdout as one line.
+///
+/// # Panics
+///
+/// Panics if the response value cannot be serialized to JSON.  Because
+/// `response` is built from `json!` and plain data, this cannot happen
+/// in practice.
 pub fn send_response(response: &serde_json::Value) {
     let mut lock = std::io::stdout().lock();
-    let _ = writeln!(lock, "{}", serde_json::to_string(response).unwrap());
+    let text = serde_json::to_string(response).expect("JSON-RPC response is always serializable");
+    let _ = writeln!(lock, "{text}");
     let _ = lock.flush();
 }
 
 /// Entry point: start the server thread, then run the stdin JSON-RPC
 /// control loop.
+///
+/// # Panics
+///
+/// Panics if the SIGINT handler cannot be registered, if reading a
+/// stdin line fails, or if the `GLOBAL_MAP` mutex is poisoned.
 pub fn main() {
     colog::init();
 
@@ -411,7 +439,9 @@ pub fn main() {
             });
             send_response(&response);
             info!("shutdown via JSON-RPC, notifying pending connections");
-            let mut lock = GLOBAL_MAP.lock().unwrap();
+            let mut lock = GLOBAL_MAP
+                .lock()
+                .expect("GLOBAL_MAP mutex is never poisoned");
             for (_, tx) in lock.drain() {
                 tx.send(Decision::Shutdown).ok();
             }
@@ -506,6 +536,12 @@ pub fn main() {
 // ── server ───────────────────────────────────────────────────────────────
 
 /// Accept client connections and spawn a handler thread per connection.
+///
+/// # Errors
+///
+/// Returns [`ProxyError::InvalidPort`] when `PORT` is not a valid
+/// `u16`, and [`ProxyError::Listener`] when binding or accepting a
+/// connection fails.
 pub fn server_thread() -> Result<(), ProxyError> {
     let port_text = std::env::var("PORT").unwrap_or_else(|_| "3128".into());
     let port: u16 = port_text
@@ -513,17 +549,21 @@ pub fn server_thread() -> Result<(), ProxyError> {
         .map_err(|_| ProxyError::InvalidPort(port_text.clone()))?;
     let listener = TcpListener::bind(format!("127.0.0.1:{port}"))?;
     info!("Server listening on 127.0.0.1:{port}");
-    for stream in listener.incoming() {
-        let stream = stream?;
+    loop {
+        let (stream, _) = listener.accept()?;
         thread::spawn(move || handle_connection(stream));
     }
-    unreachable!();
 }
 
 /// Handle one client connection from accept to close.
 ///
 /// Parses the first request, asks the controller, then acts on the
 /// decision.
+///
+/// # Panics
+///
+/// Panics when a CONNECT target is not `host:port`, when its port is
+/// not a number, or when the `GLOBAL_MAP` mutex is poisoned.
 pub fn handle_connection(mut stream: TcpStream) {
     static GLOBAL_COUNTER: AtomicU64 = AtomicU64::new(0);
     let current_count = GLOBAL_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -536,14 +576,11 @@ pub fn handle_connection(mut stream: TcpStream) {
         Ok(0) => return,
         Ok(n) => n,
         Err(e) => {
-            let body = "408 Request Timeout";
-            let res = http::Response::builder()
-                .version(Version::HTTP_11)
-                .status(StatusCode::REQUEST_TIMEOUT)
-                .header(CONTENT_LENGTH, body.len())
-                .header(CONTENT_TYPE, "text/plain")
-                .body(body)
-                .unwrap();
+            let res = plain_response(
+                Version::HTTP_11,
+                StatusCode::REQUEST_TIMEOUT,
+                "408 Request Timeout",
+            );
             write_http11(&mut stream, res).ok();
             error!("connection {current_count}: read timeout/error: {e}");
             return;
@@ -552,27 +589,30 @@ pub fn handle_connection(mut stream: TcpStream) {
 
     let mut headers = [httparse::EMPTY_HEADER; 16];
     let mut req = httparse::Request::new(&mut headers);
-    let res = match req.parse(&buffer[..size]) {
-        Ok(r) => r,
+    let consumed = match req.parse(&buffer[..size]) {
+        Ok(httparse::Status::Complete(consumed)) => consumed,
+        Ok(httparse::Status::Partial) => {
+            error!("connection {current_count}: partial request");
+            return;
+        }
         Err(e) => {
             error!("connection {current_count}: parse error: {e}");
             return;
         }
     };
-    if res.is_partial() {
-        error!("connection {current_count}: partial request");
-        return;
-    }
-    let consumed = res.unwrap();
     let leftover = buffer[consumed..size].to_vec();
 
     let Some(method) = req.method else {
         error!("connection {current_count}: missing method");
         return;
     };
+    let Some(path) = req.path else {
+        error!("connection {current_count}: missing request path");
+        return;
+    };
     let value = match method {
         "CONNECT" => {
-            let mut hostport_pair = req.path.unwrap();
+            let mut hostport_pair = path;
             if let Some(stripped) = hostport_pair.strip_prefix("https://") {
                 hostport_pair = stripped;
             }
@@ -584,11 +624,11 @@ pub fn handle_connection(mut stream: TcpStream) {
                 "params": [method, host, port, current_count]
             })
         }
-        "GET" if req.path.unwrap().starts_with("http://") => {
+        "GET" if path.starts_with("http://") => {
             json!({
                 "jsonrpc": "2.0",
                 "method": "gethttp",
-                "params": [method, req.path.unwrap(), current_count]
+                "params": [method, path, current_count]
             })
         }
         _ => {
@@ -598,7 +638,10 @@ pub fn handle_connection(mut stream: TcpStream) {
     };
 
     let (tx, rx) = sync_channel(1);
-    GLOBAL_MAP.lock().unwrap().insert(current_count, tx);
+    GLOBAL_MAP
+        .lock()
+        .expect("GLOBAL_MAP mutex is never poisoned")
+        .insert(current_count, tx);
     // Notify the controller *after* inserting into the map. Flush explicitly:
     // stdout is block-buffered when redirected (as in the VM test), so
     // without a flush the notification would sit in the buffer and the
@@ -614,10 +657,16 @@ pub fn handle_connection(mut stream: TcpStream) {
             let _ = stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n");
             let _ = stream.flush();
             stream.set_nonblocking(true).ok();
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_io()
                 .build()
-                .unwrap();
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    error!("connection {current_count}: runtime build failed: {e}");
+                    return;
+                }
+            };
             if let Err(e) = rt.block_on(async {
                 let stream = tokio::net::TcpStream::from_std(stream)?;
                 let _ = stream.set_nodelay(true);
@@ -636,14 +685,11 @@ pub fn handle_connection(mut stream: TcpStream) {
             send_502(&mut stream);
         }
         Err(RecvTimeoutError::Timeout) => {
-            let body = "504 Gateway Timeout";
-            let res = http::Response::builder()
-                .version(Version::HTTP_11)
-                .status(StatusCode::GATEWAY_TIMEOUT)
-                .header(CONTENT_LENGTH, body.len())
-                .header(CONTENT_TYPE, "text/plain")
-                .body(body)
-                .unwrap();
+            let res = plain_response(
+                Version::HTTP_11,
+                StatusCode::GATEWAY_TIMEOUT,
+                "504 Gateway Timeout",
+            );
             write_http11(&mut stream, res).ok();
             error!("connection {current_count}: controller decision timed out");
         }

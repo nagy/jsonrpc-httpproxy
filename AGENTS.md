@@ -236,13 +236,18 @@ echo '{"jsonrpc":"2.0","id":1,"method":"accept","params":[0,"example.com",443]}'
 
 ```bash
 nix build               # release package (result/bin/jsonrpc-httpproxy)
-nix flake check         # cargo tests + doctests + treefmt check + the VM test below
+nix flake check         # cargo tests + doctests + clippy + treefmt check + the VM test below
 nix build .#jsonrpc-httpproxy-doc  # static rustdoc HTML
+```
 
 Doctests run as `checks.doctests` (`cargo test --doc`); the crate has a
 lib target pointing at the shared `main.rs` (`[lib] path = "main.rs"`),
 so no separate lib file is tracked.
-```
+
+`checks.clippy` runs `cargo clippy --all-targets -- --deny warnings`
+through `craneLib.cargoClippy`.  It reuses `cargoArtifacts`, so only this
+crate recompiles under the clippy driver.  Any clippy warning fails the
+check.
 
 ### VM integration test
 
@@ -312,5 +317,6 @@ the main build stays release.
    `gethttp` connection forwards the GET request line and headers verbatim to
    the given host:port. Only `accept-file` and `deny` are meaningful for GET.
 8. **A few `unwrap()`s can panic on malformed input** — a CONNECT target
-   without `host:port` and the HTTP `Response::builder()` calls.
-   `server_thread()` propagates listener errors instead of panicking.
+   without `host:port` or with a non-numeric port, and a poisoned
+   `GLOBAL_MAP` mutex.  `server_thread()` propagates listener errors
+   instead of panicking.

@@ -63,6 +63,15 @@
             meta.description = "Doctests for the JSON-RPC-controlled HTTP proxy";
           };
 
+          # Clippy lint gate: warnings are errors. Reuses the same
+          # cargoArtifacts, so only this crate re-compiles under the clippy
+          # driver. `--all-targets` includes tests and doctests.
+          clippy = craneLib.cargoClippy {
+            inherit src cargoArtifacts;
+            cargoClippyExtraArgs = "--all-targets -- --deny warnings";
+            meta.description = "Clippy lint check for the JSON-RPC-controlled HTTP proxy";
+          };
+
           pkg = craneLib.buildPackage {
             inherit src cargoArtifacts;
             meta = {
@@ -120,6 +129,7 @@
           };
 
           checks.doctests = doctests;
+          checks.clippy = clippy;
 
           # Runs the full NixOS VM test (boots a VM, so it is slow —
           # run it alone via `nix build .#checks.x86_64-linux.jsonrpc-httpproxy-vm`).
