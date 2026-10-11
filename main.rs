@@ -24,6 +24,30 @@ use http::{
 use log::{debug, error, info};
 use serde_json::json;
 
+// ── domain newtypes ──────────────────────────────────────────────────────
+
+/// A TCP port number.
+///
+/// Wraps the raw `u16` so a caller cannot swap a port with another
+/// number argument.  The wrapper is zero-cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
+pub struct Port(pub u16);
+
+/// The connection id the proxy assigns to each client connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display, derive_more::From)]
+pub struct ConnectionId(pub u64);
+
+/// A failure in the server thread or in connection setup.
+#[derive(Debug, derive_more::Display, derive_more::Error, derive_more::From)]
+pub enum ProxyError {
+    /// The listener could not bind, or accepting a connection failed.
+    #[display("listener error: {_0}")]
+    Listener(#[from] std::io::Error),
+    /// The `PORT` environment variable is not a valid `u16`.
+    #[display("invalid PORT value: {_0}")]
+    InvalidPort(#[error(ignore)] String),
+}
+
 /// Write an HTTP/1.1 response (head + body) to `wtr`.
 ///
 /// Emits a `<version> <code> <reason>` status line, one `Name: value`
@@ -57,9 +81,9 @@ use serde_json::json;
 ///     b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\r\nhi"
 /// );
 /// ```
-pub fn write_http11<W: std::io::Write, T: Into<Vec<u8>>>(
-    wtr: &mut W,
-    response: http::Response<T>,
+pub fn write_http11(
+    wtr: &mut impl std::io::Write,
+    response: http::Response<impl Into<Vec<u8>>>,
 ) -> std::io::Result<()> {
     let (parts, body) = response.into_parts();
     let reason = parts.status.canonical_reason().unwrap_or("Unknown");
@@ -85,9 +109,9 @@ pub fn write_http11<W: std::io::Write, T: Into<Vec<u8>>>(
 /// A tiny channel handle is parked in the global map instead of the
 /// full `TcpStream`.  The connection thread keeps the stream and blocks
 /// on the receiver until the controller sends a decision.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Decision {
-    Accept { host: String, port: u16 },
+    Accept { host: String, port: Port },
     AcceptFile { path: String, mimetype: String },
     Deny,
     Shutdown,
@@ -107,12 +131,12 @@ pub static GLOBAL_MAP: LazyLock<Mutex<HashMap<u64, SyncSender<Decision>>>> =
 pub async fn tunnel(
     client: tokio::net::TcpStream,
     host: &str,
-    port: u16,
+    port: Port,
     leftover: Vec<u8>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::AsyncWriteExt;
 
-    let upstream = tokio::net::TcpStream::connect((host, port)).await?;
+    let upstream = tokio::net::TcpStream::connect((host, port.0)).await?;
     let (mut client_rd, mut client_wr) = client.into_split();
     let (mut upstream_rd, mut upstream_wr) = upstream.into_split();
 
@@ -197,7 +221,7 @@ pub fn serve_file(stream: &mut TcpStream, path: &str, mimetype: &str) {
 // ── JSON-RPC error handling ──────────────────────────────────────────────
 
 /// A JSON-RPC 2.0 error object: standard `code` plus a human message.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct JsonRpcError {
     /// One of the JSON-RPC 2.0 error codes, see the constants below.
     pub code: i64,
@@ -223,6 +247,7 @@ impl JsonRpcError {
     pub const INTERNAL_ERROR: i64 = -32603;
 
     /// Build a `METHOD_NOT_FOUND` error for an unknown method.
+    #[must_use]
     pub fn method_not_found(method: &str) -> Self {
         JsonRpcError {
             code: Self::METHOD_NOT_FOUND,
@@ -241,6 +266,7 @@ impl JsonRpcError {
     /// assert_eq!(err.code, JsonRpcError::INVALID_PARAMS);
     /// assert_eq!(err.message, "param 1: expected number");
     /// ```
+    #[must_use]
     pub fn invalid_params(msg: impl Into<String>) -> Self {
         JsonRpcError {
             code: Self::INVALID_PARAMS,
@@ -317,7 +343,7 @@ pub fn require_str(val: &serde_json::Value, pos: usize) -> Result<&str, JsonRpcE
 /// assert_eq!(req.method, "accept");
 /// assert_eq!(req.params.len(), 3);
 /// ```
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct JsonRPCRequest {
     pub jsonrpc: String,
     pub id: u64,
@@ -403,9 +429,9 @@ pub fn main() {
             match (request.method.as_str(), request.params.as_slice()) {
                 ("accept", [number, host_val, port_val, rest @ ..]) => {
                     let num = require_u64(number, 1)?;
-                    let port = u16::try_from(require_u64(port_val, 2)?).map_err(|_| {
+                    let port = Port(u16::try_from(require_u64(port_val, 2)?).map_err(|_| {
                         JsonRpcError::invalid_params("param 2: port out of range (0-65535)")
-                    })?;
+                    })?);
                     let host = require_str(host_val, 1)?;
                     let mut lock = GLOBAL_MAP.lock().unwrap();
                     match lock.remove(&num) {
@@ -480,15 +506,15 @@ pub fn main() {
 // ── server ───────────────────────────────────────────────────────────────
 
 /// Accept client connections and spawn a handler thread per connection.
-pub fn server_thread() -> Result<(), Box<dyn std::error::Error>> {
-    let port: u16 = std::env::var("PORT")
-        .unwrap_or("3128".into())
+pub fn server_thread() -> Result<(), ProxyError> {
+    let port_text = std::env::var("PORT").unwrap_or_else(|_| "3128".into());
+    let port: u16 = port_text
         .parse()
-        .unwrap();
+        .map_err(|_| ProxyError::InvalidPort(port_text.clone()))?;
     let listener = TcpListener::bind(format!("127.0.0.1:{port}"))?;
     info!("Server listening on 127.0.0.1:{port}");
     for stream in listener.incoming() {
-        let stream = stream.expect("Connection failed");
+        let stream = stream?;
         thread::spawn(move || handle_connection(stream));
     }
     unreachable!();

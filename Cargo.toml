@@ -13,6 +13,7 @@ too_many_lines = "allow"
 [dependencies]
 colog = "1.4.0"
 ctrlc = "3"
+derive_more = { version = "2.1.1", features = ["display", "error", "from"] }
 http = "1.4.0"
 httparse = "1.10.1"
 log = "0.4.29"

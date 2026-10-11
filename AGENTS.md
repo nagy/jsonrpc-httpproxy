@@ -161,6 +161,26 @@ the boundary this is mapped to either `{"result": …}` or `{"error": …}` and
 written to stdout via `send_response()`.  There is no `catch_unwind` — errors
 are first-class return values.
 
+`JsonRpcError` is a plain `Debug + Clone + PartialEq + Eq + Serialize`
+struct, not an error type: the JSON-RPC layer reports failures as protocol
+error objects, so it only needs `Display`-free wire data.  The server thread
+uses a separate `ProxyError` enum (`derive_more::Display` +
+`derive_more::Error` + `derive_more::From`):
+
+```rust
+pub enum ProxyError {
+    Listener(#[from] std::io::Error),
+    InvalidPort(#[error(ignore)] String),
+}
+```
+
+### Domain newtypes
+
+`Port(u16)` and `ConnectionId(u64)` wrap the raw primitives at API
+boundaries.  `Port` carries a zero-cost `derive_more::Display`; both derive
+`Debug`, `Clone`, `Copy`, `PartialEq`, `Eq` (`ConnectionId` adds `Hash`).
+They stop a caller from swapping a port with another number argument.
+
 ### Response helpers
 
 `send_502()`, `deny_connection()`, and `serve_file()` are called from the
@@ -189,7 +209,7 @@ line, headers, and body.
 | `PORT`  | `3128`  | TCP listen port      |
 
 Bind address is hardcoded to `127.0.0.1`.  An unparsable `PORT` (e.g.
-`PORT=abc`) panics in `server_thread()`.
+`PORT=abc`) returns `ProxyError::InvalidPort`; `main()` logs it and exits 1.
 
 Log level defaults to Info; override via `RUST_LOG` (uses `colog` →
 `env_logger`).  `debug!` output (e.g. the JSON-RPC request dump) requires
@@ -291,6 +311,6 @@ the main build stays release.
    does not track whether a connection was CONNECT or GET, so `accept` on a
    `gethttp` connection forwards the GET request line and headers verbatim to
    the given host:port. Only `accept-file` and `deny` are meaningful for GET.
-8. **A few `unwrap()`s can panic on malformed input** — an unparsable `PORT`,
-   a CONNECT target without `host:port`, and a failed `accept()` on the
-   listener (`expect`, kills `server_thread`).
+8. **A few `unwrap()`s can panic on malformed input** — a CONNECT target
+   without `host:port` and the HTTP `Response::builder()` calls.
+   `server_thread()` propagates listener errors instead of panicking.
