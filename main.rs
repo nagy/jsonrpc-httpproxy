@@ -7,9 +7,9 @@
 use std::{
     collections::HashMap,
     io::{BufRead, prelude::*},
-    net::{TcpListener, TcpStream},
+    net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     sync::{
-        LazyLock, Mutex,
+        LazyLock, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
         mpsc::{RecvTimeoutError, SyncSender, sync_channel},
     },
@@ -37,6 +37,68 @@ pub struct Port(pub u16);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display, derive_more::From)]
 pub struct ConnectionId(pub u64);
 
+/// The address family allowed for outbound connections.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, derive_more::Display)]
+pub enum AddressFamily {
+    /// Allow both families.
+    #[default]
+    #[display("any")]
+    Any,
+    /// Allow IPv4 addresses only.
+    #[display("IPv4")]
+    V4,
+    /// Allow IPv6 addresses only.
+    #[display("IPv6")]
+    V6,
+}
+
+impl AddressFamily {
+    /// Return true when `ip` belongs to this family.
+    ///
+    /// IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) count as IPv6.
+    #[must_use]
+    pub const fn allows(self, ip: IpAddr) -> bool {
+        match self {
+            Self::Any => true,
+            Self::V4 => ip.is_ipv4(),
+            Self::V6 => ip.is_ipv6(),
+        }
+    }
+}
+
+/// Command-line options.
+#[derive(Debug, Clone, clap::Parser)]
+#[command(about = "JSON-RPC-controlled HTTP/HTTPS intercepting proxy")]
+struct Cli {
+    /// Restrict outbound connections to IPv4.
+    #[arg(long, conflicts_with = "force_ipv6")]
+    force_ipv4: bool,
+    /// Restrict outbound connections to IPv6.
+    #[arg(long)]
+    force_ipv6: bool,
+}
+
+impl Cli {
+    /// The family filter selected by the flags.
+    const fn address_family(&self) -> AddressFamily {
+        if self.force_ipv4 {
+            AddressFamily::V4
+        } else if self.force_ipv6 {
+            AddressFamily::V6
+        } else {
+            AddressFamily::Any
+        }
+    }
+}
+
+/// Outbound address family, set once from the command line.
+static ADDRESS_FAMILY: OnceLock<AddressFamily> = OnceLock::new();
+
+/// Read the outbound family filter.
+fn address_family() -> AddressFamily {
+    ADDRESS_FAMILY.get().copied().unwrap_or_default()
+}
+
 /// A failure in the server thread or in connection setup.
 #[derive(Debug, derive_more::Display, derive_more::Error, derive_more::From)]
 pub enum ProxyError {
@@ -48,7 +110,120 @@ pub enum ProxyError {
     InvalidPort(#[error(ignore)] String),
 }
 
-/// Write an HTTP/1.1 response (head + body) to `wtr`.
+/// A failure while parsing a CONNECT request target.
+#[derive(Debug, Clone, PartialEq, Eq, derive_more::Display, derive_more::Error)]
+#[error(ignore)]
+pub enum TargetError {
+    /// The target has no `:port` suffix.
+    #[display("missing port in CONNECT target: {_0}")]
+    MissingPort(String),
+    /// A bracketed IPv6 host has no closing bracket.
+    #[display("unclosed IPv6 bracket in CONNECT target: {_0}")]
+    UnclosedBracket(String),
+    /// The port text is not a valid `u16`.
+    #[display("invalid port in CONNECT target: {_0}")]
+    InvalidPort(String),
+}
+
+/// Split a CONNECT target into host and port.
+///
+/// Accepts `host:port`, `[ipv6]:port`, and an optional `https://`
+/// prefix.
+///
+/// # Errors
+///
+/// Returns [`TargetError`] when the port is missing or invalid, or when
+/// the bracketed host has no closing bracket.
+///
+/// # Examples
+///
+/// ```
+/// use jsonrpc_httpproxy::{Port, parse_target};
+///
+/// assert_eq!(
+///     parse_target("example.com:443").unwrap(),
+///     ("example.com", Port(443))
+/// );
+/// assert_eq!(parse_target("[::1]:8443").unwrap(), ("::1", Port(8443)));
+/// assert_eq!(
+///     parse_target("https://example.com:80").unwrap(),
+///     ("example.com", Port(80))
+/// );
+/// ```
+pub fn parse_target(target: &str) -> Result<(&str, Port), TargetError> {
+    let target = target.strip_prefix("https://").unwrap_or(target);
+    let (host, port) = if let Some(rest) = target.strip_prefix('[') {
+        let (host, rest) = rest
+            .split_once(']')
+            .ok_or_else(|| TargetError::UnclosedBracket(target.to_owned()))?;
+        let port = rest
+            .strip_prefix(':')
+            .ok_or_else(|| TargetError::MissingPort(target.to_owned()))?;
+        (host, port)
+    } else {
+        target
+            .split_once(':')
+            .ok_or_else(|| TargetError::MissingPort(target.to_owned()))?
+    };
+    let port = port
+        .parse()
+        .map_err(|_| TargetError::InvalidPort(port.to_owned()))?;
+    Ok((host, Port(port)))
+}
+
+/// A failure while connecting to the upstream server.
+#[derive(Debug, derive_more::Display, derive_more::Error)]
+pub enum UpstreamError {
+    /// Hostname resolution failed.
+    #[display("cannot resolve upstream host: {_0}")]
+    Resolve(std::io::Error),
+    /// No resolved address matched the forced family.
+    #[display("no {_1} address for {_0}")]
+    NoMatchingAddress(#[error(ignore)] String, #[error(ignore)] AddressFamily),
+    /// Every matching address refused the connection.
+    #[display("cannot connect to any matching upstream address: {_0}")]
+    Connect(std::io::Error),
+}
+
+/// Timeout for one upstream TCP connect attempt.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Resolve `host` and connect an upstream socket in the allowed family.
+///
+/// Tries each resolved address in order and returns the first successful
+/// connection.
+///
+/// # Errors
+///
+/// Returns [`UpstreamError`] when resolution fails, when no address
+/// matches the family filter, or when every matching address fails.
+fn connect_upstream(
+    host: &str,
+    port: Port,
+    family: AddressFamily,
+) -> Result<TcpStream, UpstreamError> {
+    let addrs: Vec<SocketAddr> = (host, port.0)
+        .to_socket_addrs()
+        .map_err(UpstreamError::Resolve)?
+        .filter(|addr| family.allows(addr.ip()))
+        .collect();
+    if addrs.is_empty() {
+        return Err(UpstreamError::NoMatchingAddress(host.to_owned(), family));
+    }
+    let mut last_error = None;
+    for addr in &addrs {
+        match TcpStream::connect_timeout(addr, CONNECT_TIMEOUT) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => {
+                error!("upstream {addr} failed: {error}");
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(UpstreamError::Connect(
+        last_error.expect("address list is non-empty"),
+    ))
+}
 ///
 /// Emits a `<version> <code> <reason>` status line, one `Name: value`
 /// line per header, a blank line, then the body — all with CRLF line
@@ -144,25 +319,24 @@ fn plain_response(
 ///
 /// Writes `leftover` (bytes already read from the client past the
 /// CONNECT line) to upstream first, then copies both directions
-/// concurrently.
+/// concurrently.  The caller connects `upstream` before it writes the
+/// `200 Connection Established` response.
 ///
 /// # Errors
 ///
-/// Returns an error if the upstream connection fails, if the leftover
-/// bytes cannot be written, or if spawning a copy task fails.
+/// Returns an error if the leftover bytes cannot be written, or if
+/// spawning a copy task fails.
 ///
 /// # Panics
 ///
 /// Panics if a copy task panics while it is joined.
 pub async fn tunnel(
     client: tokio::net::TcpStream,
-    host: &str,
-    port: Port,
+    upstream: tokio::net::TcpStream,
     leftover: Vec<u8>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::AsyncWriteExt;
 
-    let upstream = tokio::net::TcpStream::connect((host, port.0)).await?;
     let (mut client_rd, mut client_wr) = client.into_split();
     let (mut upstream_rd, mut upstream_wr) = upstream.into_split();
 
@@ -190,14 +364,15 @@ pub async fn tunnel(
 
 // ── response helpers (called from the connection thread) ─────────────────
 
+/// Send a `502 Bad Gateway` response with the given body.
+fn send_502_with(stream: &mut TcpStream, body: &'static str) {
+    let res = plain_response(Version::HTTP_11, StatusCode::BAD_GATEWAY, body);
+    write_http11(stream, res).ok();
+}
+
 /// Send a `502 Bad Gateway` response, used when the proxy shuts down.
 pub fn send_502(stream: &mut TcpStream) {
-    let res = plain_response(
-        Version::HTTP_11,
-        StatusCode::BAD_GATEWAY,
-        "proxy shutting down",
-    );
-    write_http11(stream, res).ok();
+    send_502_with(stream, "proxy shutting down");
 }
 
 /// Respond `403 Forbidden` to the client.
@@ -391,6 +566,11 @@ pub fn send_response(response: &serde_json::Value) {
 pub fn main() {
     colog::init();
 
+    let cli = <Cli as clap::Parser>::parse();
+    ADDRESS_FAMILY
+        .set(cli.address_family())
+        .expect("address family set once");
+
     ctrlc::set_handler(|| {
         info!("received SIGINT, shutting down");
         std::process::exit(0);
@@ -562,8 +742,7 @@ pub fn server_thread() -> Result<(), ProxyError> {
 ///
 /// # Panics
 ///
-/// Panics when a CONNECT target is not `host:port`, when its port is
-/// not a number, or when the `GLOBAL_MAP` mutex is poisoned.
+/// Panics when the `GLOBAL_MAP` mutex is poisoned.
 pub fn handle_connection(mut stream: TcpStream) {
     static GLOBAL_COUNTER: AtomicU64 = AtomicU64::new(0);
     let current_count = GLOBAL_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -611,19 +790,20 @@ pub fn handle_connection(mut stream: TcpStream) {
         return;
     };
     let value = match method {
-        "CONNECT" => {
-            let mut hostport_pair = path;
-            if let Some(stripped) = hostport_pair.strip_prefix("https://") {
-                hostport_pair = stripped;
-            }
-            let (host, port) = hostport_pair.split_once(':').unwrap();
-            let port: u16 = port.parse().unwrap();
-            json!({
+        "CONNECT" => match parse_target(path) {
+            Ok((host, port)) => json!({
                 "jsonrpc": "2.0",
                 "method": "want",
-                "params": [method, host, port, current_count]
-            })
-        }
+                "params": [method, host, port.0, current_count]
+            }),
+            Err(e) => {
+                error!("connection {current_count}: {e}");
+                let res =
+                    plain_response(Version::HTTP_11, StatusCode::BAD_REQUEST, "400 Bad Request");
+                write_http11(&mut stream, res).ok();
+                return;
+            }
+        },
         "GET" if path.starts_with("http://") => {
             json!({
                 "jsonrpc": "2.0",
@@ -654,9 +834,21 @@ pub fn handle_connection(mut stream: TcpStream) {
 
     match rx.recv_timeout(Duration::from_secs(30)) {
         Ok(Decision::Accept { host, port }) => {
+            let upstream = match connect_upstream(&host, port, address_family()) {
+                Ok(stream) => stream,
+                Err(e) => {
+                    error!("connection {current_count}: {e}");
+                    send_502_with(&mut stream, "upstream connection failed");
+                    return;
+                }
+            };
+            // Write the 200 only after the upstream connection succeeds,
+            // so a family miss or a refused connect still gets an HTTP
+            // error status instead of a dead tunnel.
             let _ = stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n");
             let _ = stream.flush();
-            stream.set_nonblocking(true).ok();
+            let _ = stream.set_nonblocking(true);
+            let _ = upstream.set_nonblocking(true);
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_io()
                 .build()
@@ -669,8 +861,10 @@ pub fn handle_connection(mut stream: TcpStream) {
             };
             if let Err(e) = rt.block_on(async {
                 let stream = tokio::net::TcpStream::from_std(stream)?;
+                let upstream = tokio::net::TcpStream::from_std(upstream)?;
                 let _ = stream.set_nodelay(true);
-                tunnel(stream, &host, port, leftover).await
+                let _ = upstream.set_nodelay(true);
+                tunnel(stream, upstream, leftover).await
             }) {
                 error!("tunnel to {host}:{port}: {e}");
             }
@@ -693,5 +887,85 @@ pub fn handle_connection(mut stream: TcpStream) {
             write_http11(&mut stream, res).ok();
             error!("connection {current_count}: controller decision timed out");
         }
+    }
+}
+
+// ── tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_target_accepts_host_and_port() {
+        assert_eq!(
+            parse_target("example.com:443").unwrap(),
+            ("example.com", Port(443))
+        );
+    }
+
+    #[test]
+    fn parse_target_strips_https_prefix() {
+        assert_eq!(
+            parse_target("https://example.com:8443").unwrap(),
+            ("example.com", Port(8443))
+        );
+    }
+
+    #[test]
+    fn parse_target_accepts_bracketed_ipv6() {
+        assert_eq!(
+            parse_target("[2001:db8::1]:443").unwrap(),
+            ("2001:db8::1", Port(443))
+        );
+        assert_eq!(parse_target("[::1]:8443").unwrap(), ("::1", Port(8443)));
+    }
+
+    #[test]
+    fn parse_target_rejects_missing_port() {
+        assert_eq!(
+            parse_target("example.com").unwrap_err(),
+            TargetError::MissingPort("example.com".to_owned())
+        );
+        assert_eq!(
+            parse_target("[::1]").unwrap_err(),
+            TargetError::MissingPort("[::1]".to_owned())
+        );
+    }
+
+    #[test]
+    fn parse_target_rejects_unclosed_bracket() {
+        assert_eq!(
+            parse_target("[2001:db8::1:443").unwrap_err(),
+            TargetError::UnclosedBracket("[2001:db8::1:443".to_owned())
+        );
+    }
+
+    #[test]
+    fn parse_target_rejects_invalid_port() {
+        assert_eq!(
+            parse_target("example.com:http").unwrap_err(),
+            TargetError::InvalidPort("http".to_owned())
+        );
+        assert_eq!(
+            parse_target("example.com:70000").unwrap_err(),
+            TargetError::InvalidPort("70000".to_owned())
+        );
+    }
+
+    #[test]
+    fn family_filter_is_strict() {
+        let v4: IpAddr = "192.0.2.1".parse().unwrap();
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        let mapped: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+
+        assert!(AddressFamily::Any.allows(v4));
+        assert!(AddressFamily::Any.allows(v6));
+        assert!(AddressFamily::V4.allows(v4));
+        assert!(!AddressFamily::V4.allows(v6));
+        assert!(AddressFamily::V6.allows(v6));
+        assert!(!AddressFamily::V6.allows(v4));
+        assert!(!AddressFamily::V4.allows(mapped));
+        assert!(AddressFamily::V6.allows(mapped));
     }
 }

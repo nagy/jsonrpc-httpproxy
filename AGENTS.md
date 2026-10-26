@@ -120,13 +120,21 @@ enum Decision {
 ### CONNECT tunnel (`tunnel`)
 
 - Pure Rust — no external `nc` dependency.
-- The `handle_connection` thread builds a single-threaded tokio runtime
+- The upstream connect happens first, still on the connection thread:
+  `connect_upstream()` resolves the host, filters the addresses by the
+  CLI family, and tries each with `std::net::TcpStream::connect_timeout`
+  (10 s per address).  The `200 Connection Established` line is written
+  only after that connect succeeds; a family miss or a refused connect
+  gets `502 Bad Gateway`.  Resolution also happens here, so a pending or
+  denied connection never triggers a DNS query.
+- `tunnel()` receives an already-connected upstream socket.  The
+  `handle_connection` thread builds a single-threaded tokio runtime
   inline and calls `block_on(tunnel(...))`.  One OS thread per active tunnel.
 - `tokio::net::TcpStream::from_std()` **requires** a nonblocking fd — tokio
   debug-asserts this when the socket is registered (see tokio's
   `check_socket_for_blocking`; a blocking fd would also block the whole
   single-threaded runtime).  The connection thread therefore calls
-  `stream.set_nonblocking(true)` right before handing the socket over.
+  `set_nonblocking(true)` on both sockets right before handing them over.
   The stream still stays on its own thread — only the fd's blocking mode
   changes.
 - `TcpStream::into_split()` splits client and upstream each into read/write
@@ -208,8 +216,22 @@ line, headers, and body.
 |---------|---------|----------------------|
 | `PORT`  | `3128`  | TCP listen port      |
 
+| flag | meaning |
+|------|---------|
+| `--force-ipv4` | restrict outbound connections to IPv4 addresses |
+| `--force-ipv6` | restrict outbound connections to IPv6 addresses |
+
 Bind address is hardcoded to `127.0.0.1`.  An unparsable `PORT` (e.g.
 `PORT=abc`) returns `ProxyError::InvalidPort`; `main()` logs it and exits 1.
+
+`--force-ipv4` and `--force-ipv6` conflict; `clap` rejects using them
+together.  The filter applies to outbound connects only: the listener
+stays on `127.0.0.1:PORT`.  Resolution happens after a controller
+`accept` decision, so a denied connection never triggers a DNS query.
+The check is strict: an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`)
+counts as IPv6.  A connection with no address in the forced family, or
+with every matching address refusing the connect, gets `502 Bad
+Gateway` before the `200 Connection Established` line is written.
 
 Log level defaults to Info; override via `RUST_LOG` (uses `colog` →
 `env_logger`).  `debug!` output (e.g. the JSON-RPC request dump) requires
@@ -310,13 +332,16 @@ the main build stays release.
 5. **One OS thread per connection + one tokio runtime per tunnel** — fine for
    low-volume use; a full async rewrite with a shared tokio runtime would be
    needed for hundreds of concurrent connections.
-6. **Blocking `std::fs::read` in `accept-file`** — blocks the connection
-   thread while reading the file.
+6. **Blocking work on the connection thread** — `std::fs::read` in
+   `accept-file`, plus `getaddrinfo` and `connect_timeout` in the `accept`
+   path, block the per-connection thread.  One slow resolver holds only
+   that connection.
 7. **`accept` on a GET connection tunnels the raw request** — the dispatcher
    does not track whether a connection was CONNECT or GET, so `accept` on a
    `gethttp` connection forwards the GET request line and headers verbatim to
    the given host:port. Only `accept-file` and `deny` are meaningful for GET.
-8. **A few `unwrap()`s can panic on malformed input** — a CONNECT target
-   without `host:port` or with a non-numeric port, and a poisoned
-   `GLOBAL_MAP` mutex.  `server_thread()` propagates listener errors
+8. **A poisoned `GLOBAL_MAP` mutex panics** — `handle_connection` and
+   the dispatch loop call `expect` on the lock.  CONNECT target parsing
+   no longer panics: `parse_target()` returns `TargetError` and the client
+   gets `400 Bad Request`.  `server_thread()` propagates listener errors
    instead of panicking.
