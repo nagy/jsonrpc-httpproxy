@@ -247,7 +247,7 @@ cargo build
 Formatting config lives in `flake.nix` under `treefmt` (no `rustfmt.toml`
 in the repo). Format everything with `nix fmt` — treefmt drives nixfmt,
 rustfmt (unstable options like `imports_granularity = "Crate"`,
-`group_imports = "StdExternalCrate"`), and taplo.
+`group_imports = "StdExternalCrate"`, `wrap_comments = false`), and taplo.
 
 To smoke-test from stdin:
 
@@ -266,8 +266,10 @@ Doctests run as `checks.doctests` (`cargo test --doc`); the crate has a
 lib target pointing at the shared `main.rs` (`[lib] path = "main.rs"`),
 so no separate lib file is tracked.
 
-`checks.clippy` runs `cargo clippy --all-targets -- --deny warnings`
-through `craneLib.cargoClippy`.  It reuses `cargoArtifacts`, so only this
+`checks.clippy` runs `cargo clippy --all-targets --all-features -- --deny
+warnings` through `craneLib.cargoClippy`.  The crate declares no cargo
+features, so `--all-features` is a no-op today and keeps the gate correct
+if one is added later.  It reuses `cargoArtifacts`, so only this
 crate recompiles under the clippy driver.  Any clippy warning fails the
 check.
 

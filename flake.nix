@@ -56,22 +56,6 @@
             meta.description = "API documentation for the JSON-RPC-controlled HTTP proxy";
           };
 
-          # Doctests: code blocks in doc comments compiled and run against
-          # the library (`cargo test --doc`), same artifact set as above.
-          doctests = craneLib.cargoDocTest {
-            inherit src cargoArtifacts;
-            meta.description = "Doctests for the JSON-RPC-controlled HTTP proxy";
-          };
-
-          # Clippy lint gate: warnings are errors. Reuses the same
-          # cargoArtifacts, so only this crate re-compiles under the clippy
-          # driver. `--all-targets` includes tests and doctests.
-          clippy = craneLib.cargoClippy {
-            inherit src cargoArtifacts;
-            cargoClippyExtraArgs = "--all-targets -- --deny warnings";
-            meta.description = "Clippy lint check for the JSON-RPC-controlled HTTP proxy";
-          };
-
           pkg = craneLib.buildPackage {
             inherit src cargoArtifacts;
             meta = {
@@ -128,8 +112,23 @@
             meta.description = "JSON-RPC-controlled HTTP/HTTPS intercepting proxy test suite";
           };
 
-          checks.doctests = doctests;
-          checks.clippy = clippy;
+          # Clippy lint check, warnings as errors. Reuses the same
+          # cargoArtifacts, so only this crate re-compiles under the clippy
+          # driver. `--all-targets` includes tests and doctests;
+          # `--all-features` is a no-op today (no features declared) but
+          # keeps the gate honest if one is added.
+          checks.clippy = craneLib.cargoClippy {
+            inherit src cargoArtifacts;
+            cargoClippyExtraArgs = "--all-targets --all-features -- --deny warnings";
+            meta.description = "Clippy lint check for the JSON-RPC-controlled HTTP proxy";
+          };
+
+          # Doctests: code blocks in doc comments compiled and run against
+          # the library (`cargo test --doc`), same artifact set as above.
+          checks.doctests = craneLib.cargoDocTest {
+            inherit src cargoArtifacts;
+            meta.description = "Doctests for the JSON-RPC-controlled HTTP proxy";
+          };
 
           # Runs the full NixOS VM test (boots a VM, so it is slow —
           # run it alone via `nix build .#checks.x86_64-linux.jsonrpc-httpproxy-vm`).
@@ -150,7 +149,7 @@
             programs.nixfmt.enable = true;
             settings.formatter.rustfmt.options = lib.mkAfter [
               "--config"
-              "max_width=100,comment_width=100,wrap_comments=true,group_imports=StdExternalCrate,imports_granularity=Crate,condense_wildcard_suffixes=true,format_code_in_doc_comments=true,format_macro_matchers=true,format_macro_bodies=true,format_strings=true,use_field_init_shorthand=true"
+              "max_width=100,comment_width=100,wrap_comments=false,group_imports=StdExternalCrate,imports_granularity=Crate,condense_wildcard_suffixes=true,format_code_in_doc_comments=true,format_macro_matchers=true,format_macro_bodies=true,format_strings=true,use_field_init_shorthand=true"
             ];
           };
 
