@@ -221,9 +221,6 @@ it counts an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) as IPv6.
 - Keep the clippy gate at `--deny warnings`.
 - Do not add a `rustfmt.toml`. The rustfmt options live in `flake.nix` under
   treefmt.
-- Keep `Cargo.lock` committed. The Nix build has no network.
-- `git add` a new file before a build, because the flake source holds tracked files
-  alone.
 
 ## Conventions
 
