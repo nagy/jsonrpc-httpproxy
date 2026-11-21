@@ -19,8 +19,7 @@ binary, `jsonrpc-httpproxy`.
 
 ## Build and test
 
-- `nix flake check` — cargo tests, doctests, clippy, treefmt check, VM test. Gate
-  for a commit.
+- `nix flake check` — the gate. Run before a commit.
 - `nix build` — release package at `result/bin/jsonrpc-httpproxy`.
 - `nix build .#jsonrpc-httpproxy-doc` — static rustdoc HTML.
 - `nix build .#checks.x86_64-linux.jsonrpc-httpproxy-vm` — VM test alone.
