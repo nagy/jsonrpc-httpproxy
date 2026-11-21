@@ -1,100 +1,123 @@
 # AGENTS.md — jsonrpc-httpproxy
 
-A JSON-RPC-controlled HTTP/HTTPS intercepting proxy. It accepts client
-connections but **defers all routing decisions** to an external "controller"
-process via line-delimited JSON-RPC over stdin/stdout.
+## Purpose
+
+A JSON-RPC-controlled HTTP/HTTPS intercepting proxy. It accepts client connections
+and defers every routing decision to an external controller process through
+line-delimited JSON-RPC over stdin and stdout. Edition 2021. License: MIT. One
+binary, `jsonrpc-httpproxy`.
+
+## Layout
+
+- `main.rs` — the whole crate. The `[lib]` target points at it
+  (`[lib] path = "main.rs"`), so no separate lib file is tracked.
+- `test/default.nix` — NixOS VM integration test, wired into the flake as
+  `checks.jsonrpc-httpproxy-vm`.
+- `flake.nix` — flake-parts with crane and treefmt-nix: package, checks, VM test,
+  devShell.
+- `Cargo.lock` — committed. The Nix build needs it.
+
+## Build and test
+
+- `nix flake check` — cargo tests, doctests, clippy, treefmt check, VM test. Gate
+  for a commit.
+- `nix build` — release package at `result/bin/jsonrpc-httpproxy`.
+- `nix build .#jsonrpc-httpproxy-doc` — static rustdoc HTML.
+- `nix build .#checks.x86_64-linux.jsonrpc-httpproxy-vm` — VM test alone.
+- `cargo build` — local loop.
+- `nix fmt` — treefmt drives nixfmt, rustfmt (unstable options
+  `imports_granularity = "Crate"`, `group_imports = "StdExternalCrate"`,
+  `wrap_comments = false`) and taplo. No `rustfmt.toml` in the repo.
+- Smoke test from stdin: `echo '{"jsonrpc":"2.0","id":1,"method":"accept",
+  "params":[0,"example.com",443]}' | ./target/debug/jsonrpc-httpproxy`.
+
+`checks.doctests` runs `cargo test --doc`. `checks.clippy` runs `cargo clippy
+--all-targets --all-features -- --deny warnings` through `craneLib.cargoClippy`.
+The crate declares no cargo features, so `--all-features` is a no-op today and
+keeps the gate correct if a feature lands. Any clippy warning fails the check.
+
+### VM test
+
+`test/default.nix` wires the test as `checks.jsonrpc-httpproxy-vm`. Crane builds a
+separate DEBUG package for it (`env.CARGO_PROFILE = "dev"` with its own
+`buildDepsOnly` artifacts), so tokio's `debug_assert!`s run while the main build
+stays release.
+
+The test boots a VM, starts the proxy with its controller interface fed by `tail -f
+/tmp/cmds | jsonrpc-httpproxy`, serves darkhttpd's own source tree locally as the
+upstream, and runs four subtests. The client side uses `curl`. The controller side
+is a Python driver, `proxy-driver.py`, a `writeText` derivation copied into the VM,
+which waits for a notification in the log, appends the matching decision to
+`/tmp/cmds`, and asserts the documented protocol.
+
+1. CONNECT tunnel through `accept`: `200 Connection Established`, then a GET
+   through the tunnel returns `200 OK`.
+2. GET plus `accept-file`: `gethttp` notification, file served to curl.
+3. `deny`: curl receives `403 Forbidden`.
+4. `shutdown` drain: a pending connection receives `502 Bad Gateway`, then the
+   proxy exits.
 
 ## Architecture
 
-Two concurrent components run inside a single binary.
-The `TcpStream` never crosses thread boundaries — the connection thread
-keeps ownership of the socket for its entire lifetime.
+Two concurrent components run in one binary. The `TcpStream` never crosses a
+thread boundary, because the connection thread keeps ownership of the socket for
+its lifetime.
 
 ```
-┌─────────────── client connections ─────────────────────────────┐
-│                                                                 │
-│  server_thread (TcpListener :3128)                              │
-│    │  per-connection: handle_connection()  ← long-lived thread  │
-│    │    → parses CONNECT / GET                                  │
-│    │    → prints "want" / "gethttp" notification                │
-│    │    → parks SyncSender<Decision> in GLOBAL_MAP              │
-│    │    → blocks on rx.recv()                                   │
-│    │    → on Decision::Accept: tunnels via tokio inline         │
-│    │    → on Decision::AcceptFile: serve_file()                 │
-│    │    → on Decision::Deny: deny_connection()                  │
-│    │    → on Decision::Shutdown / channel close: send_502()     │
-│    │                                                            │
-│  ┌─ GLOBAL_MAP: HashMap<u64, SyncSender<Decision>>   (tiny!)    │
-│  │                                                            │
-│  main thread (stdin JSON-RPC loop)                             │
-│    ← controller sends accept / accept-file / deny / shutdown   │
-│    → sends Decision through channel (no I/O on stream)         │
-│    → responds on stdout with JSON-RPC result                   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-        ↑ stdout (notifications + responses)
-        ↓ stdin  (commands)
-   ┌──────────────┐
-   │  Controller  │  (external process — not in this repo)
-   └──────────────┘
+client connections
+  server_thread (TcpListener :3128)
+    per-connection handle_connection()  <- long-lived thread
+      parse CONNECT / GET
+      print "want" / "gethttp" notification
+      park SyncSender<Decision> in GLOBAL_MAP
+      block on rx.recv()
+      Decision::Accept      -> tokio tunnel inline
+      Decision::AcceptFile  -> serve_file()
+      Decision::Deny        -> deny_connection()
+      Decision::Shutdown    -> send_502()
+  GLOBAL_MAP: HashMap<u64, SyncSender<Decision>>   (tiny)
+  main thread (stdin JSON-RPC loop)
+    controller sends accept / accept-file / deny / shutdown
+    send Decision through the channel (no I/O on the stream)
+    respond on stdout with a JSON-RPC result
 ```
 
-## JSON-RPC protocol
+### JSON-RPC protocol
 
-All messages are single-line JSON. The server talks JSON-RPC 2.0.
+All messages are single-line JSON, JSON-RPC 2.0.
 
-### Server → controller (stdout, notifications — no `id`)
+Server to controller, on stdout, notifications without `id`:
 
-| method     | params                                         | when                           |
-|------------|------------------------------------------------|--------------------------------|
-| `want`     | `["CONNECT", host, port, connection_id]`       | client sent CONNECT            |
-| `gethttp`  | `["GET", "http://...", connection_id]`         | client sent GET to http:// URL |
+| method | params | when |
+|---|---|---|
+| `want` | `["CONNECT", host, port, connection_id]` | client sent CONNECT |
+| `gethttp` | `["GET", "http://...", connection_id]` | client sent GET to an http URL |
 
-### Controller → server (stdin, requests — have `id`)
+Controller to server, on stdin, requests with `id`:
 
-| method       | params                                  | effect                                                   |
-|------------- |-----------------------------------------|----------------------------------------------------------|
-| `accept`     | `[connection_id, host, port]`          | tunnel to upstream via tokio                              |
-| `accept-file`| `[connection_id, filepath, mimetype]`  | serve a local file as HTTP response                       |
-| `deny`       | `[connection_id]`                      | respond HTTP 403 Forbidden                                |
-| `shutdown`   | (none)                                  | send Shutdown to all pending channels, then exit          |
+| method | params | effect |
+|---|---|---|
+| `accept` | `[connection_id, host, port]` | tunnel upstream through tokio |
+| `accept-file` | `[connection_id, filepath, mimetype]` | serve a local file |
+| `deny` | `[connection_id]` | respond 403 Forbidden |
+| `shutdown` | none | send Shutdown to every pending channel, then exit |
 
-### Server → controller (stdout, responses — echo `id`)
+Server to controller, on stdout, responses echoing `id`. Success results:
+`"accepted"`, `"accepted-file"`, `"denied"`, `"shutting down"`. Errors use the
+standard JSON-RPC 2.0 error object with codes `-32700` (parse error), `-32600`
+(`jsonrpc` not `"2.0"`), `-32601` (unknown method), `-32602` (bad param type,
+unknown connection id, port out of range).
 
-Success:
-```json
-{"jsonrpc":"2.0","id":<n>,"result":"accepted"}
-{"jsonrpc":"2.0","id":<n>,"result":"accepted-file"}
-{"jsonrpc":"2.0","id":<n>,"result":"denied"}
-{"jsonrpc":"2.0","id":<n>,"result":"shutting down"}
-```
+### Channel per connection
 
-Error (standard JSON-RPC 2.0 error object):
-```json
-{"jsonrpc":"2.0","id":<n>,"error":{"code":-32602,"message":"unknown connection id: 5"}}
-{"jsonrpc":"2.0","id":<n>,"error":{"code":-32601,"message":"unknown method: bogus"}}
-{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error: ..."}}
-{"jsonrpc":"2.0","id":<n>,"error":{"code":-32600,"message":"jsonrpc must be '2.0'"}}
-```
-
-## Key implementation details
-
-### Channel-per-connection architecture
-
-Instead of parking the raw `TcpStream` in a global map and transferring it
-across threads, the connection thread **keeps ownership** of the socket for
-its entire lifetime.  Only a tiny `SyncSender<Decision>` is stored in
-`GLOBAL_MAP`:
+The connection thread keeps ownership of the socket for its lifetime. Only a tiny
+`SyncSender<Decision>` reaches `GLOBAL_MAP`:
 
 ```rust
 LazyLock<Mutex<HashMap<u64, SyncSender<Decision>>>>
 ```
 
-The connection thread blocks on `rx.recv()` until the controller (via the
-main thread) pushes a `Decision` through the channel.  The stream never
-leaves its thread: only the `Decision` travels, never the socket.
-
-#### Decision enum
+The thread blocks on `rx.recv()` until the main thread pushes a `Decision`.
 
 ```rust
 enum Decision {
@@ -105,75 +128,46 @@ enum Decision {
 }
 ```
 
-#### Benefits over the old cross-thread-stream approach
+Benefits over the old cross-thread-stream approach: one thread per connection with
+no cross-thread fd juggling, a main thread that does no I/O on a client socket,
+free shutdown because dropping the senders unblocks every `recv()`, and leftover
+bytes that stay local because `handle_connection` holds them in a stack variable
+until the tunnel starts.
 
-- **Stream ownership is clean**: one thread per connection from accept to
-  close, no cross-thread fd juggling.
-- **Main thread does no I/O on client sockets**: it only sends decisions
-  through channels — fast, non-blocking, can't panic on a dead socket.
-- **Shutdown is free**: when the process drops all `SyncSender`s (or sends
-  `Decision::Shutdown`), every blocked `recv()` unblocks.  Each connection
-  thread sends its own 502 and exits.  No central `drain_connections()`.
-- **Leftover bytes stay local**: `handle_connection` captures them after
-  `httparse` and holds them in a stack variable until the tunnel starts.
+### CONNECT tunnel
 
-### CONNECT tunnel (`tunnel`)
-
-- Pure Rust — no external `nc` dependency.
-- The upstream connect happens first, still on the connection thread:
-  `connect_upstream()` resolves the host, filters the addresses by the
-  CLI family, and tries each with `std::net::TcpStream::connect_timeout`
-  (10 s per address).  The `200 Connection Established` line is written
-  only after that connect succeeds; a family miss or a refused connect
-  gets `502 Bad Gateway`.  Resolution also happens here, so a pending or
-  denied connection never triggers a DNS query.
-- `tunnel()` receives an already-connected upstream socket.  The
-  `handle_connection` thread builds a single-threaded tokio runtime
-  inline and calls `block_on(tunnel(...))`.  One OS thread per active tunnel.
-- `tokio::net::TcpStream::from_std()` **requires** a nonblocking fd — tokio
-  debug-asserts this when the socket is registered (see tokio's
-  `check_socket_for_blocking`; a blocking fd would also block the whole
-  single-threaded runtime).  The connection thread therefore calls
-  `set_nonblocking(true)` on both sockets right before handing them over.
-  The stream still stays on its own thread — only the fd's blocking mode
-  changes.
-- `TcpStream::into_split()` splits client and upstream each into read/write
-  halves.  Two `tokio::spawn` tasks copy concurrently with proper TCP
-  half-close via `shutdown()`.
-- **`Nagle` is disabled** (`set_nodelay(true)`) for low-latency forwarding.
-- **Leftover bytes** (e.g. the TLS ClientHello) are forwarded to upstream
-  before the copy loop starts.
+- Pure Rust. No external `nc`.
+- `connect_upstream()` runs first, still on the connection thread. It resolves the
+  host, filters addresses by the CLI family, and tries each with
+  `TcpStream::connect_timeout`, 10s per address. The `200 Connection Established`
+  line is written only after the connect succeeds. A family miss or a refused
+  connect gets `502 Bad Gateway`.
+- `tunnel()` receives an already-connected upstream socket. The
+  `handle_connection` thread builds a single-threaded tokio runtime inline and
+  calls `block_on(tunnel(...))`, which costs one OS thread per active tunnel.
+- `TcpStream::from_std()` requires a nonblocking fd, and tokio debug-asserts this
+  at registration. A blocking fd would also block the whole single-threaded
+  runtime.
+- `TcpStream::into_split()` splits each peer into read and write halves. Two
+  `tokio::spawn` tasks copy concurrently with proper TCP half-close through
+  `shutdown()`.
+- `Nagle` stays disabled (`set_nodelay(true)`).
+- Leftover bytes, such as the TLS ClientHello, reach upstream before the copy loop
+  starts.
 
 ### Error handling
 
-All JSON-RPC-level errors are reported to the controller rather than
-crashing the proxy.  A lightweight `JsonRpcError` struct carries standard
-JSON-RPC 2.0 error codes:
+All JSON-RPC errors go to the controller instead of crashing the proxy. A
+`JsonRpcError` struct carries the JSON-RPC 2.0 codes. Two helpers validate
+parameters: `require_u64(val, pos)` and `require_str(val, pos)`. The dispatch
+closure returns `Result<serde_json::Value, JsonRpcError>`, and the boundary maps
+that to `{"result": ...}` or `{"error": ...}` and writes it through
+`send_response()`.
 
-| code     | constant          | returned when                                |
-|----------|-------------------|----------------------------------------------|
-| `-32700` | `PARSE_ERROR`     | stdin line is not valid JSON                  |
-| `-32600` | `INVALID_REQUEST` | `jsonrpc` field is not `"2.0"`                |
-| `-32601` | `METHOD_NOT_FOUND`| unknown method name                          |
-| `-32602` | `INVALID_PARAMS`  | wrong param type, unknown connection id, port out of range |
-
-Two tiny helpers validate parameters:
-
-```rust
-fn require_u64(val: &Value, pos: usize) -> Result<u64, JsonRpcError>;
-fn require_str(val: &Value, pos: usize) -> Result<&str, JsonRpcError>;
-```
-
-The dispatch closure returns `Result<serde_json::Value, JsonRpcError>`.  At
-the boundary this is mapped to either `{"result": …}` or `{"error": …}` and
-written to stdout via `send_response()`.  There is no `catch_unwind` — errors
-are first-class return values.
-
-`JsonRpcError` is a plain `Debug + Clone + PartialEq + Eq + Serialize`
-struct, not an error type: the JSON-RPC layer reports failures as protocol
-error objects, so it only needs `Display`-free wire data.  The server thread
-uses a separate `ProxyError` enum (`derive_more::Display` +
-`derive_more::Error` + `derive_more::From`):
+`JsonRpcError` stays a plain `Debug + Clone + PartialEq + Eq + Serialize` struct,
+not an error type, because the JSON-RPC layer reports failures as protocol error
+objects and needs no `Display`. The server thread uses a separate `ProxyError`
+enum with `derive_more::Display`, `Error` and `From`:
 
 ```rust
 pub enum ProxyError {
@@ -184,166 +178,92 @@ pub enum ProxyError {
 
 ### Domain newtypes
 
-`Port(u16)` and `ConnectionId(u64)` wrap the raw primitives at API
-boundaries.  `Port` carries a zero-cost `derive_more::Display`; both derive
-`Debug`, `Clone`, `Copy`, `PartialEq`, `Eq` (`ConnectionId` adds `Hash`).
-They stop a caller from swapping a port with another number argument.
+`Port(u16)` and `ConnectionId(u64)` wrap the raw primitives at API boundaries.
+`Port` carries a zero-cost `derive_more::Display`. Both derive `Debug`, `Clone`,
+`Copy`, `PartialEq` and `Eq`, and `ConnectionId` adds `Hash`. They stop a caller
+from swapping a port with another number argument.
 
 ### Response helpers
 
-`send_502()`, `deny_connection()`, and `serve_file()` are called from the
-connection thread to write HTTP responses directly to the client socket.
-They use `write_http11` internally and silently ignore I/O errors (the
-client may have disconnected).
+`send_502()`, `deny_connection()` and `serve_file()` run on the connection thread
+and write HTTP responses straight to the client socket through `write_http11`.
+They ignore I/O errors, because the client may have disconnected.
+`send_response()` writes a JSON-RPC response to stdout from the main thread and
+also ignores I/O errors. `write_http11` is generic over `W: Write` and handles
+HTTP/1.0 and HTTP/1.1 with status line, headers and body.
 
-`send_response()` writes a JSON-RPC response/error to stdout from the main
-thread.  It also ignores I/O errors — if stdout is broken the proxy is
-unusable anyway.
+### Configuration
 
-Controller notifications (`want`/`gethttp`) also flush stdout explicitly.
-Without the flush, `println!` on a redirected stdout (e.g. in the VM test)
-is block-buffered and the notification would sit in the buffer, so a
-controller reading stdout line-by-line would never see it promptly.
+| Variable | Default | Meaning |
+|---|---|---|
+| `PORT` | `3128` | TCP listen port. |
+| `RUST_LOG` | Info | Log level through `colog` and `env_logger`. `debug` dumps the JSON-RPC requests. |
 
-### HTTP response writer (`write_http11`)
+| Flag | Meaning |
+|---|---|
+| `--force-ipv4` | Restrict outbound connects to IPv4. |
+| `--force-ipv6` | Restrict outbound connects to IPv6. |
 
-Generic over `W: Write`. Handles both HTTP/1.0 and HTTP/1.1 with status
-line, headers, and body.
+Bind address stays hardcoded to `127.0.0.1`. An unparsable `PORT` returns
+`ProxyError::InvalidPort`, which `main()` logs before exit 1. `clap` rejects the
+two family flags together. The family filter touches outbound connects alone, and
+it counts an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) as IPv6.
 
-## Configuration
+## Rules
 
-| env var | default | meaning              |
-|---------|---------|----------------------|
-| `PORT`  | `3128`  | TCP listen port      |
+- Flush stdout for the `want` and `gethttp` notifications. Without the flush,
+  `println!` on a redirected stdout is block-buffered, and the notification sits in
+  the buffer while a controller reads line by line.
+- Call `set_nonblocking(true)` on both sockets right before the handover to tokio.
+  The stream still stays on its own thread, and only the fd blocking mode changes.
+- Report a JSON-RPC failure through the error object. No `catch_unwind`, because
+  errors stay first-class return values.
+- Keep the clippy gate at `--deny warnings`.
+- Do not add a `rustfmt.toml`. The rustfmt options live in `flake.nix` under
+  treefmt.
+- Keep `Cargo.lock` committed. The Nix build has no network.
+- `git add` a new file before a build, because the flake source holds tracked files
+  alone.
 
-| flag | meaning |
-|------|---------|
-| `--force-ipv4` | restrict outbound connections to IPv4 addresses |
-| `--force-ipv6` | restrict outbound connections to IPv6 addresses |
+## Conventions
 
-Bind address is hardcoded to `127.0.0.1`.  An unparsable `PORT` (e.g.
-`PORT=abc`) returns `ProxyError::InvalidPort`; `main()` logs it and exits 1.
+- Wrap a raw primitive in a newtype at an API boundary, as `Port` and
+  `ConnectionId` do.
+- Derive `Display`, `Error` and `From` with `derive_more`.
+- Keep comments out of the wrapped state. rustfmt runs with `wrap_comments =
+  false`.
+- Log through `colog` and `env_logger`. A `debug!` line needs `RUST_LOG=debug`.
+- Name a helper after the action it performs: `send_502`, `deny_connection`,
+  `serve_file`, `send_response`, `write_http11`.
 
-`--force-ipv4` and `--force-ipv6` conflict; `clap` rejects using them
-together.  The filter applies to outbound connects only: the listener
-stays on `127.0.0.1:PORT`.  Resolution happens after a controller
-`accept` decision, so a denied connection never triggers a DNS query.
-The check is strict: an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`)
-counts as IPv6.  A connection with no address in the forced family, or
-with every matching address refusing the connect, gets `502 Bad
-Gateway` before the `200 Connection Established` line is written.
+## Open work
 
-Log level defaults to Info; override via `RUST_LOG` (uses `colog` →
-`env_logger`).  `debug!` output (e.g. the JSON-RPC request dump) requires
-`RUST_LOG=debug`.
-
-## Build & run
-
-The repo is a nix flake (`flake.nix`, flake-parts + crane + treefmt-nix).
-```bash
-cargo build
-```
-
-Formatting config lives in `flake.nix` under `treefmt` (no `rustfmt.toml`
-in the repo). Format everything with `nix fmt` — treefmt drives nixfmt,
-rustfmt (unstable options like `imports_granularity = "Crate"`,
-`group_imports = "StdExternalCrate"`, `wrap_comments = false`), and taplo.
-
-To smoke-test from stdin:
-
-```bash
-echo '{"jsonrpc":"2.0","id":1,"method":"accept","params":[0,"example.com",443]}' \
-  | ./target/debug/jsonrpc-httpproxy
-```
-
-```bash
-nix build               # release package (result/bin/jsonrpc-httpproxy)
-nix flake check         # cargo tests + doctests + clippy + treefmt check + the VM test below
-nix build .#jsonrpc-httpproxy-doc  # static rustdoc HTML
-```
-
-Doctests run as `checks.doctests` (`cargo test --doc`); the crate has a
-lib target pointing at the shared `main.rs` (`[lib] path = "main.rs"`),
-so no separate lib file is tracked.
-
-`checks.clippy` runs `cargo clippy --all-targets --all-features -- --deny
-warnings` through `craneLib.cargoClippy`.  The crate declares no cargo
-features, so `--all-features` is a no-op today and keeps the gate correct
-if one is added later.  It reuses `cargoArtifacts`, so only this
-crate recompiles under the clippy driver.  Any clippy warning fails the
-check.
-
-### VM integration test
-
-`test/default.nix` carries a NixOS VM integration test, wired into the
-flake as `checks.jsonrpc-httpproxy-vm` (crane builds a separate DEBUG
-package for it — `env.CARGO_PROFILE = "dev"` with its own
-`buildDepsOnly` artifacts — so tokio's debug_assert!s run while the main
-build stays release). It exercises the full controller protocol
-end-to-end, with no internet access:
-
-```bash
-nix build .#checks.x86_64-linux.jsonrpc-httpproxy-vm
-# or everything at once (slower):
-nix flake check
-```
-
-The test boots a VM, starts the proxy (debug build, so tokio's
-debug_assert!s run) with its controller interface fed by
-`tail -f /tmp/cmds | jsonrpc-httpproxy`, serves darkhttpd's own source
-tree locally as the upstream, and runs four subtests that drive the proxy
-like a real controller would (JSON-RPC commands appended to `/tmp/cmds`,
-notifications + responses read from `/tmp/proxy.log`):
-
-1. **CONNECT tunnel (accept)** — curl `--proxytunnel` CONNECTs through the
-   proxy, `accept` decision, `200 Connection Established`, GET through the
-   tunnel returns `200 OK`
-2. **GET + accept-file** — `gethttp` notification, `accept-file` decision,
-   curl gets the file
-3. **deny** — `deny` decision, curl gets `403 Forbidden`
-4. **shutdown drain** — pending connection gets a graceful `502 Bad
-   Gateway`, proxy exits
-
-The client side uses `curl` (real HTTP semantics); the controller side is
-a Python driver (`proxy-driver.py`, a `writeText` derivation copied into
-the VM) that plays the controller: it waits for the proxy's notification
-in the log, appends the matching JSON-RPC decision to `/tmp/cmds`, and
-asserts the documented protocol. The test runs against a DEBUG build so
-debug_assert!s (e.g. tokio's `check_socket_for_blocking`) are exercised;
-the main build stays release.
-
-## Known limitations / future work
-
-1. ~~**No timeout on pending connections**~~ — resolved: client read has 5 s
-   timeout (→ 408), controller decision has 30 s timeout (→ 504).
-2. **Every connection thread writes to stdout** — one `println!` notification
-   per connection thread, plus the main thread's responses: N+1 writers.
-   Individual lines are not torn (all writers go through the process-wide
-   stdout lock), but notification/response *ordering* is arbitrary, so a
-   controller must correlate by `connection_id` / `id`. A single-writer mpsc
-   channel would be safer.
-3. **SIGINT handler doesn't drain** — it calls `process::exit(0)` to avoid
-   potential deadlock on the `GLOBAL_MAP` mutex.  Clients get TCP RST instead
-   of a graceful 502.  The JSON-RPC `shutdown` method *does* drain gracefully
-   (it sleeps 500 ms after notifying channels so the connection threads can
-   write their 502s before `process::exit`).
-4. **`accept-file`, `deny`, and the 504-timeout path throw away leftover
-   bytes** — if the client sent data after its request line on a GET or a
-   denied CONNECT, those bytes are silently dropped. (On `accept` they are
-   forwarded to upstream.)
-5. **One OS thread per connection + one tokio runtime per tunnel** — fine for
-   low-volume use; a full async rewrite with a shared tokio runtime would be
-   needed for hundreds of concurrent connections.
-6. **Blocking work on the connection thread** — `std::fs::read` in
-   `accept-file`, plus `getaddrinfo` and `connect_timeout` in the `accept`
-   path, block the per-connection thread.  One slow resolver holds only
-   that connection.
-7. **`accept` on a GET connection tunnels the raw request** — the dispatcher
-   does not track whether a connection was CONNECT or GET, so `accept` on a
-   `gethttp` connection forwards the GET request line and headers verbatim to
-   the given host:port. Only `accept-file` and `deny` are meaningful for GET.
-8. **A poisoned `GLOBAL_MAP` mutex panics** — `handle_connection` and
-   the dispatch loop call `expect` on the lock.  CONNECT target parsing
-   no longer panics: `parse_target()` returns `TargetError` and the client
-   gets `400 Bad Request`.  `server_thread()` propagates listener errors
-   instead of panicking.
+1. No timeout on a pending connection. Resolved: the client read has a 5s timeout
+   that answers 408, and the controller decision has a 30s timeout that answers
+   504.
+2. Every connection thread writes to stdout, one notification per thread plus the
+   main thread responses, so N+1 writers. Lines do not tear, because every writer
+   goes through the process-wide stdout lock, but notification and response
+   ordering stays arbitrary, so a controller must correlate by `connection_id` and
+   `id`. A single-writer mpsc channel would be safer.
+3. The SIGINT handler does not drain. It calls `process::exit(0)` to avoid a
+   potential deadlock on the `GLOBAL_MAP` mutex, so clients get a TCP RST instead
+   of a graceful 502. The JSON-RPC `shutdown` method does drain: it sleeps 500ms
+   after notifying channels, so the connection threads can write their 502s before
+   `process::exit`.
+4. `accept-file`, `deny` and the 504 timeout throw away leftover bytes. Data a
+   client sent after its request line on a GET or a denied CONNECT drops silently.
+   On `accept` those bytes reach upstream.
+5. One OS thread per connection plus one tokio runtime per tunnel. Fine for
+   low-volume use. Hundreds of concurrent connections need a full async rewrite
+   with a shared tokio runtime.
+6. Blocking work on the connection thread: `std::fs::read` in `accept-file`, plus
+   `getaddrinfo` and `connect_timeout` in the `accept` path. One slow resolver
+   holds only its own connection.
+7. `accept` on a GET connection tunnels the raw request, because the dispatcher
+   does not track CONNECT against GET. Only `accept-file` and `deny` carry meaning
+   for a GET connection.
+8. A poisoned `GLOBAL_MAP` mutex panics, because `handle_connection` and the
+   dispatch loop call `expect` on the lock. CONNECT target parsing no longer
+   panics: `parse_target()` returns `TargetError` and the client gets `400 Bad
+   Request`. `server_thread()` propagates listener errors instead of panicking.
